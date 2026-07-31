@@ -6,8 +6,8 @@
 
 // --------- Motors ---------
 L298NX2 motor_drive(6, 13, 12, 5, 8, 7); // EN_A, IN1_A, IN2_A, EN_B, IN1_B, IN2_B
-L298N motor_bar_up (3, 2, 4);
-L298N motor_bar_down (9, 19, 18);
+//L298N motor_bar_up (3, 2, 4);
+//L298N motor_bar_down (9, 19, 18);
 unsigned int run_time_to_pose = 1500; //to be tuned
 
 Adafruit_PWMServoDriver servo_hub = Adafruit_PWMServoDriver(0x40);
@@ -26,9 +26,8 @@ const float close_position = 100;
 const float angle_change = 30; //change in angle for change in pose
 const float delay_to_pose = 800;
 
-static uint16_t angleToPulse(float angle, float minAngle=0, float maxAngle=180,
-                             uint16_t minPulse=150, uint16_t maxPulse=600) {
-  // Typical servo pulse range: ~150us..600us (tune if needed)
+static uint16_t angleToPulse(float angle, float minAngle=0, float maxAngle=180, //SG90
+                             uint16_t minPulse=1000, uint16_t maxPulse=2000) {
   if (angle < minAngle) angle = minAngle;
   if (angle > maxAngle) angle = maxAngle;
 
@@ -36,9 +35,8 @@ static uint16_t angleToPulse(float angle, float minAngle=0, float maxAngle=180,
   return (uint16_t)(minPulse + t * (maxPulse - minPulse));
 }
 
-static uint16_t angleToPulse2(float angle, float minAngle=0, float maxAngle=180,
-                             uint16_t minPulse=150, uint16_t maxPulse=600) {
-  // Typical servo pulse range: ~150us..600us (tune if needed)
+static uint16_t angleToPulse2(float angle, float minAngle=0, float maxAngle=180, //other servo lol
+                             uint16_t minPulse=500, uint16_t maxPulse=2500) {
   if (angle < minAngle) angle = minAngle;
   if (angle > maxAngle) angle = maxAngle;
 
@@ -47,7 +45,7 @@ static uint16_t angleToPulse2(float angle, float minAngle=0, float maxAngle=180,
 }
 
 // --------- LED ---------
-const int ledPin = 14;
+const int ledPin = 14; //A0
 unsigned long led_flash_timer = 0;
 bool led_state = true;
 
@@ -211,35 +209,33 @@ void down_detach() {
 }
 
 void up_attach() {
-    servo_hub.writeMicroseconds(chServoUpL, angleToPulse(close_position));
-    servo_hub.writeMicroseconds(chServoUpR, angleToPulse(180 - close_position));   
+    setBarPosition("parallel");
     delay(delay_to_pose);
-    setBarPosition("parallel");    
+    servo_hub.writeMicroseconds(chServoUpL, angleToPulse(close_position));
+    servo_hub.writeMicroseconds(chServoUpR, angleToPulse(180 - close_position));      
 }
 
 void down_attach() {
-    servo_hub.writeMicroseconds(chServoDownL, angleToPulse(close_position));
-    servo_hub.writeMicroseconds(chServoDownR, angleToPulse(180 - close_position));   
+    setBarPosition("parallel");
     delay(delay_to_pose);
-    setBarPosition("parallel");     
+    servo_hub.writeMicroseconds(chServoDownL, angleToPulse(close_position));
+    servo_hub.writeMicroseconds(chServoDownR, angleToPulse(180 - close_position));      
 }
 
 void both_attach() {
+    setBarPosition("parallel");
+    delay(delay_to_pose);  
     servo_hub.writeMicroseconds(chServoUpL, angleToPulse(close_position));
     servo_hub.writeMicroseconds(chServoUpR, angleToPulse(180 - close_position));   
     servo_hub.writeMicroseconds(chServoDownL, angleToPulse(close_position));
-    servo_hub.writeMicroseconds(chServoDownR, angleToPulse(180 - close_position));   
-    delay(delay_to_pose);
-    setBarPosition("parallel");         
+    servo_hub.writeMicroseconds(chServoDownR, angleToPulse(180 - close_position));         
 }
 
 void both_detach() {
+    setBarPosition("parallel");
+    delay(delay_to_pose);
     servo_hub.writeMicroseconds(chServoUpL, angleToPulse(open_position));
     servo_hub.writeMicroseconds(chServoUpR, angleToPulse(180 - open_position));   
     servo_hub.writeMicroseconds(chServoDownL, angleToPulse(open_position));
-    servo_hub.writeMicroseconds(chServoDownR, angleToPulse(180 - open_position));     
-    delay(delay_to_pose);
-    setBarPosition("parallel");       
+    servo_hub.writeMicroseconds(chServoDownR, angleToPulse(180 - open_position));         
 }
-
-
