@@ -20,12 +20,18 @@ fi
 echo "[*] System packages"
 apt-get update -y
 # NB: libatlas-base-dev / libjpeg-dev used to be helpful for numpy + opencv
-# wheels, but on Debian trixie the dev packages are gone or renamed and the
-# opencv-python-headless wheels we use ship their own native deps. Skip them.
+# wheels, but on Debian trixie the dev packages are gone or renamed.
+#
+# The opencv-python-headless wheel on piwheels (cv2 5.0.x for cp313/armv7l)
+# still links against libOpenEXR-3_1 and libopenblas0 at runtime, plus the
+# usual libGL / libXext / libSM stack. Install them here so `import cv2`
+# doesn't fail later. --no-install-recommends keeps the image small.
 apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv \
     hostapd dnsmasq avahi-daemon \
-    v4l-utils
+    v4l-utils \
+    libopenexr-3-1-30 libopenblas0 \
+    libgl1 libsm6 libxext6 libxrender1
 
 # Make sure the run user can talk to the Arduino (ttyACM*) and to the camera.
 # dialout -> /dev/ttyACM* / /dev/ttyUSB*; video -> /dev/video*.
@@ -37,14 +43,36 @@ done
 
 echo "[*] Python venv -> /opt/climbingrobot"
 install -d -o "$RUN_USER" -g "$RUN_GROUP" /opt/climbingrobot
-python3 -m venv /opt/climbingrobot/venv
+# Reuse an existing venv if it's already healthy (saves ~3 minutes of pip
+# work on every re-run). Only nuke it if cv2 import fails at the end.
+if [[ ! -x /opt/climbingrobot/venv/bin/python ]]; then
+    python3 -m venv /opt/climbingrobot/venv
+fi
+chown -R "$RUN_USER:$RUN_GROUP" /opt/climbingrobot
+
 # shellcheck disable=SC1091
 source /opt/climbingrobot/venv/bin/activate
 pip install --upgrade pip
+# If the full opencv-python wheel got installed by mistake (it depends on
+# libgtk / libavcodec / libOpenEXR and a dozen more .so files), get rid of
+# it before installing the headless variant. This is idempotent.
+pip uninstall -y opencv-python opencv-contrib-python 2>/dev/null || true
 pip install --no-cache-dir \
     "websockets>=12" \
-    "opencv-python-headless>=4.6" \
+    "opencv-python-headless>=4.10" \
     "pyserial>=3.5"
+
+# Sanity-check cv2 right here so we don't enable systemd services that will
+# fail on first boot. If the wheel is broken (libOpenEXR missing, wrong
+# platform tag, etc.) we want to scream now, not silently leave the user
+# with a half-installed bridge.
+echo "[*] Verifying cv2 import"
+if ! python -c "import cv2, numpy, websockets, serial; print('cv2', cv2.__version__, 'numpy', numpy.__version__)"; then
+    echo "!! cv2 import failed. The piwheels headless wheel usually needs" >&2
+    echo "!!   libopenexr-3-1-30 libopenblas0 libgl1 libsm6 libxext6 libxrender1" >&2
+    echo "!! from apt. Re-run apt-get install with those, then re-run this script." >&2
+    exit 1
+fi
 
 echo "[*] Copying bridge scripts"
 install -m 755 "$REPO_DIR/pi_serial_bridge.py" /opt/climbingrobot/pi_serial_bridge.py

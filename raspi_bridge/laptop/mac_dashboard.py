@@ -39,7 +39,7 @@ import websockets
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 # ---------------------------- Configuration ----------------------------
-DEFAULT_HOST = "192.168.4.1"
+DEFAULT_HOST = "pi.local"
 WS_PATH      = "/bus"
 HTTP_STREAM  = f"http://{DEFAULT_HOST}:8080/stream"
 LOG_DIR      = Path.home() / "Documents" / "ClimbingRobotLogs"
@@ -55,8 +55,8 @@ class Telemetry:
     imu_gx: float = 0.0
     imu_gy: float = 0.0
     imu_gz: float = 0.0
-    tof_front: int = 0
-    tof_rear: int = 0
+    tof_up: int = 0
+    tof_down: int = 0
     drive_speed: int = 0
     direction: str = "FORWARD"
     bar_pose: str = "parallel"
@@ -247,7 +247,7 @@ class SessionLogger:
                 "host_t_ms",
                 "imu_ax", "imu_ay", "imu_az",
                 "imu_gx", "imu_gy", "imu_gz",
-                "tof_front_mm", "tof_rear_mm",
+                "tof_up_mm", "tof_down_mm",
                 "speed", "direction", "bar_pose", "last_ack",
             ])
         self._lock = Lock()
@@ -259,7 +259,7 @@ class SessionLogger:
                     int(time.time() * 1000),
                     t.imu_ax, t.imu_ay, t.imu_az,
                     t.imu_gx, t.imu_gy, t.imu_gz,
-                    t.tof_front, t.tof_rear,
+                    t.tof_up, t.tof_down,
                     t.drive_speed, t.direction, t.bar_pose, t.last_ack,
                 ])
             with open(self.jsonl_path, "a") as f:
@@ -267,7 +267,7 @@ class SessionLogger:
                     "host_t_ms": int(time.time() * 1000),
                     "imu": {"ax": t.imu_ax, "ay": t.imu_ay, "az": t.imu_az,
                             "gx": t.imu_gx, "gy": t.imu_gy, "gz": t.imu_gz},
-                    "tof": {"front": t.tof_front, "rear": t.tof_rear},
+                    "tof": {"front": t.tof_up, "rear": t.tof_down},
                     "status": {
                         "speed": t.drive_speed,
                         "direction": t.direction,
@@ -365,12 +365,12 @@ class Dashboard(QtWidgets.QMainWindow):
         # TOF
         tof_box = QtWidgets.QGroupBox("Time-of-Flight")
         tof_layout = QtWidgets.QFormLayout(tof_box)
-        self.lbl_tof_front = QtWidgets.QLabel("----")
-        self.lbl_tof_rear  = QtWidgets.QLabel("----")
-        for lbl in (self.lbl_tof_front, self.lbl_tof_rear):
+        self.lbl_tof_up = QtWidgets.QLabel("----")
+        self.lbl_tof_down  = QtWidgets.QLabel("----")
+        for lbl in (self.lbl_tof_up, self.lbl_tof_down):
             lbl.setStyleSheet("font-family:Menlo,monospace;font-size:13px")
-        tof_layout.addRow("Front (mm)", self.lbl_tof_front)
-        tof_layout.addRow("Rear  (mm)", self.lbl_tof_rear)
+        tof_layout.addRow("Front (mm)", self.lbl_tof_up)
+        tof_layout.addRow("Rear  (mm)", self.lbl_tof_down)
         right_layout.addWidget(tof_box)
 
         # Status (now with 4 new fields vs. v1)
@@ -464,8 +464,8 @@ class Dashboard(QtWidgets.QMainWindow):
             self.telem.imu_gx      = imu.get("gx", 0)
             self.telem.imu_gy      = imu.get("gy", 0)
             self.telem.imu_gz      = imu.get("gz", 0)
-            self.telem.tof_front   = tof.get("front", 0)
-            self.telem.tof_rear    = tof.get("rear",  0)
+            self.telem.tof_up   = tof.get("front", 0)
+            self.telem.tof_down    = tof.get("rear",  0)
             self.telem.drive_speed = int(msg.get("speed", 0))
             self.telem.direction   = str(msg.get("dir", "FORWARD"))
             self.telem.bar_pose    = str(msg.get("pose", "parallel"))
@@ -521,8 +521,8 @@ class Dashboard(QtWidgets.QMainWindow):
         self.lbl_gx.setText(f"{t.imu_gx:+.2f}")
         self.lbl_gy.setText(f"{t.imu_gy:+.2f}")
         self.lbl_gz.setText(f"{t.imu_gz:+.2f}")
-        self.lbl_tof_front.setText(str(t.tof_front))
-        self.lbl_tof_rear.setText(str(t.tof_rear))
+        self.lbl_tof_up.setText(str(t.tof_up))
+        self.lbl_tof_down.setText(str(t.tof_down))
         self.lbl_speed.setText(str(t.drive_speed))
         self.lbl_dir.setText(t.direction)
         self.lbl_pose.setText(t.bar_pose)

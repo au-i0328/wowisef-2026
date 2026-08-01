@@ -33,18 +33,18 @@
 #include <Adafruit_Sensor.h>
 #include <VL53L0X.h>
 
-const uint8_t TOF_FRONT_XSHUT = A1;
-const uint8_t TOF_REAR_XSHUT  = A2;
+const uint8_t tof_up_XSHUT = A1;
+const uint8_t TOF_DOWN_XSHUT  = A2;
 
 Adafruit_MPU6050 mpu;
-VL53L0X          tof_front;
-VL53L0X          tof_rear;
+VL53L0X          tof_up;
+VL53L0X          tof_down;
 
 // ===================== Sensors state =====================
 volatile float    imu_ax = 0, imu_ay = 0, imu_az = 0;
 volatile float    imu_gx = 0, imu_gy = 0, imu_gz = 0;
-volatile uint16_t tof_front_mm = 0;
-volatile uint16_t tof_rear_mm  = 0;
+volatile uint16_t tof_up_mm = 0;
+volatile uint16_t tof_down_mm  = 0;
 volatile bool     sensors_ok = false;
 
 // ===================== Status export =====================
@@ -107,22 +107,22 @@ bool initMPU() {
 }
 
 bool initTOF() {
-  pinMode(TOF_FRONT_XSHUT, OUTPUT);
-  pinMode(TOF_REAR_XSHUT,  OUTPUT);
-  digitalWrite(TOF_REAR_XSHUT,  LOW);
-  digitalWrite(TOF_FRONT_XSHUT, LOW);
-  digitalWrite(TOF_FRONT_XSHUT, HIGH);
+  pinMode(TOF_UP_XSHUT, OUTPUT);
+  pinMode(TOF_DOWN_XSHUT,  OUTPUT);
+  digitalWrite(TOF_DOWN_XSHUT,  LOW);
+  digitalWrite(TOF_UP_XSHUT, LOW);
+  digitalWrite(TOF_UP_XSHUT, HIGH);
   delay(50);
-  if (!tof_front.init()) return false;
-  tof_front.setAddress(0x30);
+  if (!tof_up.init()) return false;
+  tof_up.setAddress(0x30);
   delay(50);
-  digitalWrite(TOF_REAR_XSHUT, HIGH);
+  digitalWrite(TOF_DOWN_XSHUT, HIGH);
   delay(50);
-  if (!tof_rear.init()) return false;
-  tof_rear.setAddress(0x31);
+  if (!tof_down.init()) return false;
+  tof_down.setAddress(0x31);
   delay(50);
-  tof_front.startContinuous();
-  tof_rear.startContinuous();
+  tof_up.startContinuous();
+  tof_down.startContinuous();
   return true;
 }
 
@@ -136,8 +136,8 @@ void readSensors() {
     imu_gy = g.gyro.y;
     imu_gz = g.gyro.z;
   }
-  tof_front_mm = tof_front.readRangeContinuousMillimeters();
-  tof_rear_mm  = tof_rear.readRangeContinuousMillimeters();
+  tof_up_mm = tof_up.readRangeContinuousMillimeters();
+  tof_down_mm  = tof_down.readRangeContinuousMillimeters();
 }
 
 // ===================== Hand-rolled JSON (no ArduinoJson) =====================
@@ -180,9 +180,9 @@ void emitStatusLine() {
   Serial.print(buf_g[2]);
   Serial.print(F("},\"tof\":{"
                  "\"front\":"));
-  Serial.print(tof_front_mm);
+  Serial.print(tof_up_mm);
   Serial.print(F(",\"rear\":"));
-  Serial.print(tof_rear_mm);
+  Serial.print(tof_down_mm);
   Serial.print(F("}}"));
   Serial.println();
 }
