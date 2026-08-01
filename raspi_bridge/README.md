@@ -8,7 +8,6 @@ PS4 controller  --USB/BT-->  MacBook  --WiFi-->  Pi Zero 2 W  --USB-->  Arduino 
                                 |                   |                     |
                                 |                   |                     +- PCA9685 servos
                                 |                   |                     +- L298NX2 drive
-                                |                   |                     +- MPU6050 IMU
                                 |                   |                     +- 2x VL53L0X TOF
                                 |                   |
                                 |                   +- HTTP /stream (MJPEG)
@@ -22,7 +21,7 @@ PS4 controller  --USB/BT-->  MacBook  --WiFi-->  Pi Zero 2 W  --USB-->  Arduino 
 
 | File | Where it runs | Purpose |
 |------|---------------|---------|
-| `arduino/arduino_bridge.ino` | Arduino UNO | Motor/servo control + IMU + TOF + 200ms status JSON |
+| `arduino/arduino_bridge.ino` | Arduino UNO | Motor/servo control + TOF + 200ms status JSON |
 | `pi/pi_serial_bridge.py`     | Pi Zero 2 W | USB-serial <-> WebSocket bus relay |
 | `pi/pi_video_stream.py`      | Pi Zero 2 W | USB webcam -> MJPEG HTTP stream |
 | `pi/pi_ap_setup.sh`          | Pi Zero 2 W | hostapd + dnsmasq access-point setup |
@@ -48,17 +47,16 @@ Additions for v2:
 
 | Component | Arduino pin | Notes |
 |-----------|-------------|-------|
-| MPU6050 (IMU) | I2C (SDA=A4, SCL=A5) | AD0 -> GND (default 0x68) |
-| VL53L0X #1 (front) | XSHUT -> A1, I2C | address 0x30 after re-init |
-| VL53L0X #2 (rear)  | XSHUT -> A2, I2C | address 0x31 after re-init |
+| VL53L0X #1 (up)   | XSHUT -> A1, I2C | address 0x30 after re-init |
+| VL53L0X #2 (down) | XSHUT -> A2, I2C | address 0x31 after re-init |
 | L298NX2 drive | 6,13,12,5,8,7 | unchanged |
 | PCA9685 (servos) | I2C | address 0x40, unchanged |
 | Status LED | A0 | unchanged |
 
 XSHUT wiring is required so the two VL53L0X sensors can be re-addressed
 sequentially on the same bus. The sketch drives:
-1. rear_XSHUT LOW, front_XSHUT HIGH, init front -> setAddress(0x30)
-2. rear_XSHUT HIGH, init rear -> setAddress(0x31)
+1. down_XSHUT LOW, up_XSHUT HIGH, init up -> setAddress(0x30)
+2. down_XSHUT HIGH, init down -> setAddress(0x31)
 
 ## Serial protocol
 
@@ -77,8 +75,7 @@ Status JSON shape (one per 200 ms):
   "dir": "FORWARD",
   "pose": "parallel",
   "ack": "up_attach",
-  "imu": {"ax": 0.0, "ay": 0.0, "az": 9.81, "gx": 0.0, "gy": 0.0, "gz": 0.0},
-  "tof": {"front": 350, "rear": 120}
+  "tof": {"up": 350, "down": 120}
 }
 ```
 
@@ -105,7 +102,7 @@ Outgoing message kinds:
 
 ```json
 { "kind": "telemetry", "speed": 150, "dir": "FORWARD", "pose": "parallel",
-  "ack": "up_attach", "imu": {...}, "tof": {...} }
+  "ack": "up_attach", "tof": {...} }
 { "kind": "ack", "cmd": "up_attach" }
 ```
 

@@ -260,7 +260,7 @@ async def main_async(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="192.168.4.1", help="Pi AP IP")
+    ap.add_argument("--host", default="pi.local", help="Pi AP IP")
     ap.add_argument("--port", default=81, type=int)
     ap.add_argument("--path", default="/bus")
     ap.add_argument("--test", action="store_true",

@@ -272,17 +272,9 @@ class SerialBus:
                 "dir": "FORWARD",
                 "pose": "parallel",
                 "ack": "NONE",
-                "imu": {
-                    "ax": round(0.0 * t, 2),
-                    "ay": round(0.0 * t, 2),
-                    "az": round(9.81 + 0.0 * t, 2),
-                    "gx": round(0.0 * t, 2),
-                    "gy": round(0.0 * t, 2),
-                    "gz": round(0.0 * t, 2),
-                },
                 "tof": {
-                    "front": 350 + int(5 * (t % 3)),
-                    "rear":  120 + int(5 * (t % 4)),
+                    "up": 350 + int(5 * (t % 3)),
+                    "down": 120 + int(5 * (t % 4)),
                 },
             }
             await self._broadcast(payload)

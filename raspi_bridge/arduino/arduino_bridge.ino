@@ -2,8 +2,7 @@
  * Arduino Bridge — extends sketch_jul30/sketch_jul30.ino
  * --------------------------------------------------
  *  - Motor control, servos, bar-pose logic: unchanged from sketch_jul30
- *  - Adds: MPU6050 IMU read
- *  - Adds: 2x VL53L0X TOF read (front + rear) via XSHUT re-addressing
+ *  - Adds: 2x VL53L0X TOF read (up + down) via XSHUT re-addressing
  *  - Adds: 200 ms periodic JSON status exports with prefix "STS:"
  *  - Keeps: existing `ACK:<cmd>` lines emitted only on command events
  *
@@ -19,9 +18,8 @@
  *
  * Wire the sensors on the Arduino's I2C bus (the Wire already started in
  * sketch_jul30 setup()):
- *   - MPU6050          AD0 -> GND (default 0x68)
- *   - VL53L0X front    XSHUT on A1, INT -> NC
- *   - VL53L0X rear     XSHUT on A2, INT -> NC
+ *   - VL53L0X up       XSHUT on A1, INT -> NC
+ *   - VL53L0X down     XSHUT on A2, INT -> NC
  */
 
 #include <Adafruit_PWMServoDriver.h>
@@ -29,20 +27,15 @@
 #include <Servo.h>
 #include <L298NX2.h>
 #include <Wire.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
 #include <VL53L0X.h>
 
-const uint8_t tof_up_XSHUT = A1;
-const uint8_t TOF_DOWN_XSHUT  = A2;
+const int TOF_UP_XSHUT = 10;
+const int TOF_DOWN_XSHUT  = 11;
 
-Adafruit_MPU6050 mpu;
 VL53L0X          tof_up;
 VL53L0X          tof_down;
 
 // ===================== Sensors state =====================
-volatile float    imu_ax = 0, imu_ay = 0, imu_az = 0;
-volatile float    imu_gx = 0, imu_gy = 0, imu_gz = 0;
 volatile uint16_t tof_up_mm = 0;
 volatile uint16_t tof_down_mm  = 0;
 volatile bool     sensors_ok = false;
@@ -74,12 +67,12 @@ const int chServoBarUpR = 5;
 const int chServoBarDownL = 6;
 const int chServoBarDownR = 7;
 
-const float open_position = 0;
-const float close_position = 100;
-const float angle_change = 30;
-const float delay_to_pose = 800;
+const float open_position = 0; //degrees
+const float close_position = 100; //degrees
+const float angle_change = 30; //degrees
+const float delay_to_pose = 800; //ms
 
-static uint16_t angleToPulse(float angle, float minAngle=0, float maxAngle=180,
+static uint16_t angleToPulse(float angle, float minAngle=0, float maxAngle=180, //for SG90
                              uint16_t minPulse=1000, uint16_t maxPulse=2000) {
   if (angle < minAngle) angle = minAngle;
   if (angle > maxAngle) angle = maxAngle;
@@ -87,7 +80,7 @@ static uint16_t angleToPulse(float angle, float minAngle=0, float maxAngle=180,
   return (uint16_t)(minPulse + t * (maxPulse - minPulse));
 }
 
-static uint16_t angleToPulse2(float angle, float minAngle=0, float maxAngle=180,
+static uint16_t angleToPulse2(float angle, float minAngle=0, float maxAngle=180, //for DS3218MG
                              uint16_t minPulse=500, uint16_t maxPulse=2500) {
   if (angle < minAngle) angle = minAngle;
   if (angle > maxAngle) angle = maxAngle;
@@ -96,16 +89,6 @@ static uint16_t angleToPulse2(float angle, float minAngle=0, float maxAngle=180,
 }
 
 // ===================== Sensor init =====================
-bool initMPU() {
-  if (!mpu.begin()) {
-    return false;
-  }
-  mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
-  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-  return true;
-}
-
 bool initTOF() {
   pinMode(TOF_UP_XSHUT, OUTPUT);
   pinMode(TOF_DOWN_XSHUT,  OUTPUT);
@@ -127,30 +110,12 @@ bool initTOF() {
 }
 
 void readSensors() {
-  sensors_event_t a, g, t;
-  if (mpu.getEvent(&a, &g, &t)) {
-    imu_ax = a.acceleration.x;
-    imu_ay = a.acceleration.y;
-    imu_az = a.acceleration.z;
-    imu_gx = g.gyro.x;
-    imu_gy = g.gyro.y;
-    imu_gz = g.gyro.z;
-  }
   tof_up_mm = tof_up.readRangeContinuousMillimeters();
   tof_down_mm  = tof_down.readRangeContinuousMillimeters();
 }
 
 // ===================== Hand-rolled JSON (no ArduinoJson) =====================
-// AVR doesn't have snprintf for floats well; use dtostrf.
 void emitStatusLine() {
-  char buf_a[3][12], buf_g[3][12];
-  dtostrf(imu_ax, 6, 2, buf_a[0]);
-  dtostrf(imu_ay, 6, 2, buf_a[1]);
-  dtostrf(imu_az, 6, 2, buf_a[2]);
-  dtostrf(imu_gx, 6, 2, buf_g[0]);
-  dtostrf(imu_gy, 6, 2, buf_g[1]);
-  dtostrf(imu_gz, 6, 2, buf_g[2]);
-
   unsigned int speed = motor_drive.getSpeed();
   L298N::Direction d = motor_drive.getDirection();
   const char* dir_s = (d == L298N::FORWARD) ? "FORWARD" :
@@ -165,23 +130,10 @@ void emitStatusLine() {
   Serial.print(current_bar_pose);
   Serial.print(F("\",\"ack\":\""));
   Serial.print(last_cmd);
-  Serial.print(F("\",\"imu\":{"
-                 "\"ax\":"));
-  Serial.print(buf_a[0]);
-  Serial.print(F(",\"ay\":"));
-  Serial.print(buf_a[1]);
-  Serial.print(F(",\"az\":"));
-  Serial.print(buf_a[2]);
-  Serial.print(F(",\"gx\":"));
-  Serial.print(buf_g[0]);
-  Serial.print(F(",\"gy\":"));
-  Serial.print(buf_g[1]);
-  Serial.print(F(",\"gz\":"));
-  Serial.print(buf_g[2]);
-  Serial.print(F("},\"tof\":{"
-                 "\"front\":"));
+  Serial.print(F("\",\"tof\":{"
+                 "\"up\":"));
   Serial.print(tof_up_mm);
-  Serial.print(F(",\"rear\":"));
+  Serial.print(F(",\"down\":"));
   Serial.print(tof_down_mm);
   Serial.print(F("}}"));
   Serial.println();
@@ -202,12 +154,9 @@ void setup() {
   servo_hub.reset();
   servo_hub.setPWMFreq(50);
 
-  bool mpu_ok = initMPU();
   bool tof_ok = initTOF();
-  sensors_ok = mpu_ok && tof_ok;
-  Serial.print(F("INIT: mpu="));
-  Serial.print(mpu_ok ? "OK" : "FAIL");
-  Serial.print(F(" tof="));
+  sensors_ok = tof_ok;
+  Serial.print(F("INIT: tof="));
   Serial.println(tof_ok ? "OK" : "FAIL");
 
   both_attach();

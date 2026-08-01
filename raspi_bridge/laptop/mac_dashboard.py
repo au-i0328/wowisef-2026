@@ -49,12 +49,6 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 # ---------------------------- Telemetry state ----------------------------
 @dataclass
 class Telemetry:
-    imu_ax: float = 0.0
-    imu_ay: float = 0.0
-    imu_az: float = 0.0
-    imu_gx: float = 0.0
-    imu_gy: float = 0.0
-    imu_gz: float = 0.0
     tof_up: int = 0
     tof_down: int = 0
     drive_speed: int = 0
@@ -245,8 +239,6 @@ class SessionLogger:
         with open(self.csv_path, "w", newline="") as f:
             csv.writer(f).writerow([
                 "host_t_ms",
-                "imu_ax", "imu_ay", "imu_az",
-                "imu_gx", "imu_gy", "imu_gz",
                 "tof_up_mm", "tof_down_mm",
                 "speed", "direction", "bar_pose", "last_ack",
             ])
@@ -257,17 +249,13 @@ class SessionLogger:
             with open(self.csv_path, "a", newline="") as f:
                 csv.writer(f).writerow([
                     int(time.time() * 1000),
-                    t.imu_ax, t.imu_ay, t.imu_az,
-                    t.imu_gx, t.imu_gy, t.imu_gz,
                     t.tof_up, t.tof_down,
                     t.drive_speed, t.direction, t.bar_pose, t.last_ack,
                 ])
             with open(self.jsonl_path, "a") as f:
                 f.write(json.dumps({
                     "host_t_ms": int(time.time() * 1000),
-                    "imu": {"ax": t.imu_ax, "ay": t.imu_ay, "az": t.imu_az,
-                            "gx": t.imu_gx, "gy": t.imu_gy, "gz": t.imu_gz},
-                    "tof": {"front": t.tof_up, "rear": t.tof_down},
+                    "tof": {"up": t.tof_up, "down": t.tof_down},
                     "status": {
                         "speed": t.drive_speed,
                         "direction": t.direction,
@@ -341,26 +329,6 @@ class Dashboard(QtWidgets.QMainWindow):
         conn_row.addStretch()
         conn_row.addWidget(QtWidgets.QLabel(f"Host: {self.host}"))
         right_layout.addLayout(conn_row)
-
-        # IMU
-        imu_box = QtWidgets.QGroupBox("IMU (MPU6050)")
-        imu_layout = QtWidgets.QFormLayout(imu_box)
-        self.lbl_ax = QtWidgets.QLabel("0.00")
-        self.lbl_ay = QtWidgets.QLabel("0.00")
-        self.lbl_az = QtWidgets.QLabel("0.00")
-        self.lbl_gx = QtWidgets.QLabel("0.00")
-        self.lbl_gy = QtWidgets.QLabel("0.00")
-        self.lbl_gz = QtWidgets.QLabel("0.00")
-        for lbl in (self.lbl_ax, self.lbl_ay, self.lbl_az,
-                    self.lbl_gx, self.lbl_gy, self.lbl_gz):
-            lbl.setStyleSheet("font-family:Menlo,monospace;font-size:13px")
-        imu_layout.addRow("Accel X (m/s²)", self.lbl_ax)
-        imu_layout.addRow("Accel Y (m/s²)", self.lbl_ay)
-        imu_layout.addRow("Accel Z (m/s²)", self.lbl_az)
-        imu_layout.addRow("Gyro  X (°/s)", self.lbl_gx)
-        imu_layout.addRow("Gyro  Y (°/s)", self.lbl_gy)
-        imu_layout.addRow("Gyro  Z (°/s)", self.lbl_gz)
-        right_layout.addWidget(imu_box)
 
         # TOF
         tof_box = QtWidgets.QGroupBox("Time-of-Flight")
@@ -455,17 +423,10 @@ class Dashboard(QtWidgets.QMainWindow):
         self.conn_indicator.setStyleSheet("color:#c33;font-weight:bold")
 
     def _on_telemetry(self, msg: dict):
-        imu = msg.get("imu", {})
         tof = msg.get("tof", {})
         with self.telem_lock:
-            self.telem.imu_ax      = imu.get("ax", 0)
-            self.telem.imu_ay      = imu.get("ay", 0)
-            self.telem.imu_az      = imu.get("az", 0)
-            self.telem.imu_gx      = imu.get("gx", 0)
-            self.telem.imu_gy      = imu.get("gy", 0)
-            self.telem.imu_gz      = imu.get("gz", 0)
-            self.telem.tof_up   = tof.get("front", 0)
-            self.telem.tof_down    = tof.get("rear",  0)
+            self.telem.tof_up   = tof.get("up", 0)
+            self.telem.tof_down = tof.get("down", 0)
             self.telem.drive_speed = int(msg.get("speed", 0))
             self.telem.direction   = str(msg.get("dir", "FORWARD"))
             self.telem.bar_pose    = str(msg.get("pose", "parallel"))
@@ -515,12 +476,6 @@ class Dashboard(QtWidgets.QMainWindow):
     def _refresh_labels(self):
         with self.telem_lock:
             t = self.telem
-        self.lbl_ax.setText(f"{t.imu_ax:+.2f}")
-        self.lbl_ay.setText(f"{t.imu_ay:+.2f}")
-        self.lbl_az.setText(f"{t.imu_az:+.2f}")
-        self.lbl_gx.setText(f"{t.imu_gx:+.2f}")
-        self.lbl_gy.setText(f"{t.imu_gy:+.2f}")
-        self.lbl_gz.setText(f"{t.imu_gz:+.2f}")
         self.lbl_tof_up.setText(str(t.tof_up))
         self.lbl_tof_down.setText(str(t.tof_down))
         self.lbl_speed.setText(str(t.drive_speed))
