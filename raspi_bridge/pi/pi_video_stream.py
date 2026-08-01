@@ -20,6 +20,7 @@ Run on the Pi:
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import threading
@@ -63,6 +64,8 @@ class FrameSource:
         self._opened = False
 
     def open(self) -> bool:
+        """Try to open the real device. On failure, return False; the
+        driver's outer retry loop will handle backoff / fallback."""
         if self.test_mode:
             self._t0 = time.time()
             self._opened = True
@@ -89,7 +92,7 @@ class FrameSource:
                          self._cap.get(cv2.CAP_PROP_FPS))
                 return True
             cap.release()
-        log.error("Video source: failed to open %s", self.device)
+        log.warning("Video source: failed to open %s", self.device)
         return False
 
     def close(self):
@@ -220,17 +223,58 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default=DEFAULT_HOST)
     ap.add_argument("--port", default=DEFAULT_PORT, type=int)
-    ap.add_argument("--device", default="/dev/video0")
+    ap.add_argument("--device", default="/dev/video0",
+                    help="V4L2 device path. Ignored when --test is set.")
     ap.add_argument("--width",  default=640, type=int)
     ap.add_argument("--height", default=480, type=int)
     ap.add_argument("--fps",    default=20.0, type=float)
     ap.add_argument("--test", action="store_true",
-                    help="Serve a synthetic test pattern (no webcam needed)")
+                    help="Serve a synthetic test pattern (no webcam needed).")
+    ap.add_argument("--auto-test", action="store_true",
+                    help="Fall back to --test automatically if no camera is "
+                         "found within --wait-device seconds.")
+    ap.add_argument("--wait-device", default="60", type=float,
+                    help="Seconds to wait for the webcam before falling back "
+                         "or giving up. Use -1 to wait forever (default 60).")
     args = ap.parse_args()
 
-    src = FrameSource(args.device, args.width, args.height, args.fps, args.test)
-    if not src.open():
-        sys.exit(1)
+    # /etc/default/climbingrobot can force mock mode at startup.
+    env_force_test = os.environ.get("TEST_MODE", "0") == "1"
+    test_mode = args.test or env_force_test
+    fallback = args.auto_test and not test_mode
+
+    if env_force_test and not args.test:
+        log.warning("TEST_MODE=1 in environment — forcing synthetic video")
+
+    if not test_mode:
+        deadline = None if args.wait_device < 0 else time.time() + args.wait_device
+        log.info("Looking for video device %s (--wait-device=%s)",
+                 args.device, args.wait_device)
+        while True:
+            src = FrameSource(args.device, args.width, args.height, args.fps,
+                              test_mode=False)
+            if src.open():
+                break
+            src.close()
+            now = time.time()
+            if deadline is not None and now >= deadline:
+                if fallback:
+                    log.warning("No camera after %.0fs — switching to "
+                                "--test mode", args.wait_device)
+                    test_mode = True
+                    break
+                log.error(
+                    "No camera device found and auto-test disabled. "
+                    "Pass --test or --auto-test for a synthetic stream.",
+                )
+                sys.exit(1)
+            time.sleep(2.0)
+    if test_mode:
+        src = FrameSource(args.device, args.width, args.height, args.fps,
+                          test_mode=True)
+        if not src.open():
+            log.error("Failed to initialise synthetic source (impossible?)")
+            sys.exit(1)
 
     StreamHandler.source = src
     httpd = ThreadingHTTPServer((args.host, args.port), StreamHandler)
@@ -244,8 +288,9 @@ def main():
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    log.info("Serving video on http://%s:%d  (try /stream /snapshot /health)",
-             args.host, args.port)
+    mode = "MOCK" if src.test_mode else f"device {src.device}"
+    log.info("Serving video on http://%s:%d  (mode=%s; /stream /snapshot /health)",
+             args.host, args.port, mode)
     try:
         httpd.serve_forever()
     finally:

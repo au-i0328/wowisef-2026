@@ -21,8 +21,7 @@ AP_SSID="ClimbingRobot"
 AP_PASSWORD="climb12345"
 AP_CHANNEL="5"
 AP_IP="192.168.4.1"
-AP_NETMASK="255.255.255.0"
-AP_NET="${AP_IP%.*}.0/24"
+AP_NETMASK="255.255.255.0"   # kept for reference; nmcli uses /24 CIDR
 AP_DHCP_START="192.168.4.10"
 AP_DHCP_END="192.168.4.100"
 AP_IFACE="${AP_IFACE:-wlan1}"
@@ -46,28 +45,32 @@ if ! ip link show "$AP_IFACE" &>/dev/null; then
 fi
 echo "[*] Using interface: $AP_IFACE"
 
-echo "[*] Installing hostapd + dnsmasq"
-apt-get update -y
+echo "[*] Installing hostapd + dnsmasq + NetworkManager (Lite images may lack NM)"
+if ! command -v nmcli >/dev/null; then
+    apt-get install -y network-manager
+    systemctl enable --now NetworkManager
+    sleep 2   # give NM a moment to scan interfaces
+fi
 apt-get install -y hostapd dnsmasq
 
-# Disable NetworkManager management of the AP interface
+echo "[*] Static IP for $AP_IFACE via NetworkManager"
 mkdir -p /etc/NetworkManager/conf.d
 cat >/etc/NetworkManager/conf.d/ignore-ap-iface.conf <<EOF
 [keyfile]
 unmanaged-devices=interface-name:${AP_IFACE}
 EOF
 
-echo "[*] Static IP for $AP_IFACE"
-cat >/etc/network/interfaces.d/${AP_IFACE} <<EOF
-allow-hotplug ${AP_IFACE}
-iface ${AP_IFACE} inet static
-    address ${AP_IP}
-    netmask ${AP_NETMASK}
-EOF
-
-# Bring up the interface with the new address
-ifdown "$AP_IFACE" 2>/dev/null || true
-ifup "$AP_IFACE" 2>/dev/null || true
+# Use nmcli to set a static IP on the AP interface (trixie / Bookworm+).
+# Disable any existing WiFi profile, then apply a manual ipv4 address.
+nmcli radio wifi off &>/dev/null || true
+if nmcli -t -f NAME con show 2>/dev/null | grep -qx "${AP_IFACE}"; then
+    nmcli con delete "${AP_IFACE}" &>/dev/null || true
+fi
+nmcli con add type ethernet ifname "${AP_IFACE}" con-name "${AP_IFACE}" \
+       ipv4.method manual ipv4.addresses "${AP_IP}/24" \
+       ipv4.never-default yes ipv6.method disabled \
+       connection.autoconnect yes
+nmcli con up "${AP_IFACE}" &>/dev/null || true
 
 echo "[*] hostapd config -> /etc/hostapd/hostapd.conf"
 cat >/etc/hostapd/hostapd.conf <<EOF
@@ -88,24 +91,39 @@ rsn_pairwise=CCMP
 EOF
 
 # Tell hostapd where to read its config
+sed -i 's|^#DAEMON_CONF=.*|DAEMON_CONF="/etc/hostapd/hostapd.conf"|' /etc/default/hostapd
 grep -q '^DAEMON_CONF=' /etc/default/hostapd 2>/dev/null \
   || echo 'DAEMON_CONF="/etc/hostapd/hostapd.conf"' >>/etc/default/hostapd
-sed -i 's|^#DAEMON_CONF=.*|DAEMON_CONF="/etc/hostapd/hostapd.conf"|' /etc/default/hostapd
-
-# Point /etc/hostapd/hostapd.conf as the default config in hostapd main
-grep -q '^DAEMON_CONF=' /etc/default/hostapd && \
-  sed -i 's|^DAEMON_CONF=.*|DAEMON_CONF="/etc/hostapd/hostapd.conf"|' /etc/default/hostapd
+sed -i 's|^DAEMON_CONF=.*|DAEMON_CONF="/etc/hostapd/hostapd.conf"|' /etc/default/hostapd
 
 echo "[*] dnsmasq config -> /etc/dnsmasq.d/climbingrobot.conf"
+# Disable systemd-resolved so dnsmasq can bind port 53 (typical on trixie).
+if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    systemctl disable --now systemd-resolved
+    rm -f /etc/resolv.conf
+    echo "nameserver ${AP_IP}" > /etc/resolv.conf
+fi
 cat >/etc/dnsmasq.d/climbingrobot.conf <<EOF
 interface=${AP_IFACE}
 bind-interfaces
+listen-address=${AP_IP}
 domain-needed
 bogus-priv
 dhcp-range=${AP_DHCP_START},${AP_DHCP_END},12h
 dhcp-option=3,${AP_IP}
 dhcp-option=6,${AP_IP}
+log-queries
+log-dhcp
+log-facility=/var/log/dnsmasq.log
 EOF
+mkdir -p /var/log
+touch /var/log/dnsmasq.log
+
+# Validate the config before trying to start the service
+echo "[*] Validating dnsmasq config"
+if ! dnsmasq --test -C /etc/dnsmasq.d/climbingrobot.conf 2>&1; then
+    echo "    ! dnsmasq --test failed — see output above" >&2
+fi
 
 # Stop and disable conflicting services
 systemctl stop wpa_supplicant 2>/dev/null || true
@@ -122,10 +140,20 @@ systemctl enable avahi-daemon
 sed -i 's/^#publish-addresses=yes/publish-addresses=yes/' /etc/avahi/avahi-daemon.conf 2>/dev/null || true
 
 echo "[*] Restarting services"
-systemctl restart dnsmasq
-systemctl restart hostapd
+systemctl restart dnsmasq || {
+    echo "    ! dnsmasq failed to start. Recent logs:"
+    journalctl -u dnsmasq --no-pager -n 20 || true
+    echo "    --- /var/log/dnsmasq.log ---"
+    tail -n 20 /var/log/dnsmasq.log 2>/dev/null || true
+}
+systemctl restart hostapd || {
+    echo "    ! hostapd failed to start. Recent logs:"
+    journalctl -u hostapd --no-pager -n 20 || true
+}
 systemctl restart avahi-daemon || true
-
 sleep 1
+echo ""
+echo "[*] Service status"
+systemctl is-active dnsmasq hostapd avahi-daemon 2>/dev/null || true
 echo "[*] Done. SSID=${AP_SSID}  Password=${AP_PASSWORD}  IP=${AP_IP}"
 ip addr show "$AP_IFACE" | grep inet || true

@@ -57,17 +57,40 @@ logging.basicConfig(
 log = logging.getLogger("bridge")
 
 # ---------------------------- Serial port discovery ----------------------------
-def find_arduino_port() -> Optional[str]:
-    """Return first /dev/serial/by-id/ symlink, else /dev/ttyACM0, else None."""
-    by_id = sorted(glob.glob("/dev/serial/by-id/*"))
-    if by_id:
-        log.info("Arduino serial device (by-id): %s", by_id[0])
-        return by_id[0]
-    for cand in ("/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyUSB0", "/dev/ttyUSB1"):
-        if os.path.exists(cand):
-            log.info("Arduino serial device (fallback): %s", cand)
-            return cand
-    return None
+def find_arduino_port(wait_seconds: float = 0.0,
+                      log_waiting: bool = True) -> Optional[str]:
+    """Return first /dev/serial/by-id/ symlink, else /dev/ttyACM0, else None.
+
+    With ``wait_seconds > 0`` we poll for the device to appear before giving
+    up — handy when the Arduino powers up a moment after the Pi.
+
+    With ``wait_seconds < 0`` we wait essentially forever and only return
+    when the device is found. This is the default for the systemd services
+    so a missing Arduino no longer crash-loops the bridge.
+    """
+    first_pass = True
+    while True:
+        by_id = sorted(glob.glob("/dev/serial/by-id/*"))
+        if by_id:
+            log.info("Arduino serial device (by-id): %s", by_id[0])
+            return by_id[0]
+        for cand in ("/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyUSB0", "/dev/ttyUSB1"):
+            if os.path.exists(cand):
+                log.info("Arduino serial device (fallback): %s", cand)
+                return cand
+        if wait_seconds == 0.0:
+            return None
+        if first_pass and log_waiting:
+            log.warning(
+                "Arduino serial not detected yet (check USB cable / power). "
+                "Use --test for a synthetic bridge.",
+            )
+            first_pass = False
+        if wait_seconds > 0:
+            time.sleep(1.0)
+            return None  # one-shot probe; outer driver will handle retries
+        # wait_seconds < 0 → poll forever
+        time.sleep(2.0)
 
 # ---------------------------- Bus ----------------------------
 class SerialBus:
@@ -90,18 +113,30 @@ class SerialBus:
     async def start(self):
         if not self.test_mode:
             assert self.port is not None
-            try:
-                self._ser = serial.Serial(
-                    self.port, self.baud,
-                    timeout=0.1, write_timeout=SERIAL_WDEAD,
-                    rtscts=False, xonxoff=False,
-                )
-                self._ser.reset_input_buffer()
-                self._ser.reset_output_buffer()
-                log.info("Opened serial %s @ %d", self.port, self.baud)
-            except Exception as e:
-                log.error("Failed to open serial: %s", e)
-                raise
+            # Open the serial port with a few retries; the Arduino may
+            # reset itself right after enumeration and pyserial returns
+            # "Resource temporarily unavailable" briefly.
+            last_err: Optional[Exception] = None
+            for attempt in range(8):
+                try:
+                    self._ser = serial.Serial(
+                        self.port, self.baud,
+                        timeout=0.1, write_timeout=SERIAL_WDEAD,
+                        rtscts=False, xonxoff=False,
+                    )
+                    self._ser.reset_input_buffer()
+                    self._ser.reset_output_buffer()
+                    log.info("Opened serial %s @ %d", self.port, self.baud)
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    log.warning("Serial open attempt %d/8 failed: %s",
+                                attempt + 1, e)
+                    await asyncio.sleep(0.5)
+            if last_err is not None:
+                log.error("Giving up opening serial: %s", last_err)
+                raise last_err
         self._reader_task = asyncio.create_task(self._reader_loop())
         self._writer_task = asyncio.create_task(self._writer_loop())
 
@@ -114,7 +149,9 @@ class SerialBus:
             if t:
                 try:
                     await t
-                except Exception:
+                except BaseException:
+                    # CancelledError (and any task-internal errors) are
+                    # expected during shutdown — swallow them.
                     pass
         if self._ser:
             try:
@@ -315,16 +352,51 @@ async def main():
     ap.add_argument("--port", default=WS_PORT, type=int, help="WS port")
     ap.add_argument("--serial", default=None, help="Serial device path")
     ap.add_argument("--baud", default=SERIAL_BAUD, type=int)
-    ap.add_argument("--test", action="store_true", help="Mock serial I/O")
+    ap.add_argument("--test", action="store_true",
+                    help="Mock serial I/O (no Arduino needed).")
+    ap.add_argument(
+        "--auto-test", action="store_true",
+        help="Use --test mode automatically if no Arduino is detected "
+             "within --wait-serial seconds (default off).",
+    )
+    ap.add_argument(
+        "--wait-serial", default="60", type=float,
+        help="Seconds to wait for the Arduino before giving up / falling "
+             "back. Use -1 to wait forever (default 60).",
+    )
     args = ap.parse_args()
 
+    # /etc/default/climbingrobot can force mock mode at startup.
+    env_force_test = os.environ.get("TEST_MODE", "0") == "1"
+
     port = args.serial
-    test_mode = args.test
+    test_mode = args.test or env_force_test
+    fallback_to_test = (args.auto_test and not test_mode)
+
+    if env_force_test and not args.test:
+        log.warning("TEST_MODE=1 in environment — forcing mock serial")
+        test_mode = True
+
     if not test_mode and not port:
-        port = find_arduino_port()
+        wait = args.wait_serial
+        if wait < 0:
+            log.info("Waiting for Arduino serial device (--wait-serial=-1)")
+            port = find_arduino_port(wait_seconds=-1)
+        else:
+            port = find_arduino_port(wait_seconds=wait)
         if not port:
-            log.error("No Arduino serial detected. Use --test or --serial /dev/ttyACM0")
-            sys.exit(1)
+            if fallback_to_test:
+                log.warning(
+                    "No Arduino after %.0fs — falling back to --test mode",
+                    wait,
+                )
+                test_mode = True
+            else:
+                log.error(
+                    "No Arduino serial detected. Pass --test, "
+                    "--auto-test, or set TEST_MODE=1 to run without hardware.",
+                )
+                sys.exit(1)
 
     bus = SerialBus(port, args.baud, test_mode)
     await bus.start()
@@ -342,7 +414,9 @@ async def main():
         except NotImplementedError:
             pass
 
-    log.info("WebSocket server on ws://%s:%d%s", WS_HOST, args.port, WS_PATH)
+    mode = "MOCK" if test_mode else f"real serial {port}"
+    log.info("WebSocket server on ws://%s:%d%s  (%s)",
+             WS_HOST, args.port, WS_PATH, mode)
     async with ws_serve(server, WS_HOST, args.port, max_size=64 * 1024):
         await stop.wait()
     await bus.stop()

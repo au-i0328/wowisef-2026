@@ -59,7 +59,7 @@ const int ledPin = 14;
 unsigned long led_flash_timer = 0;
 bool led_state = true;
 
-// --------- Motors (preserved) ---------
+// --------- Motors ----------
 L298NX2 motor_drive(6, 13, 12, 5, 8, 7);
 unsigned int run_time_to_pose = 1500;
 
