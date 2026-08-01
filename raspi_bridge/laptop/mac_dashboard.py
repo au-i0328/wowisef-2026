@@ -68,6 +68,7 @@ class Telemetry:
     last_ack: str = "NONE"
     received_at: float = 0.0
     latched: bool = False
+    latch_reason: str = ""
 
 
 # ---------------------------- Async WS client (subscribe-only) ----------------------------
@@ -561,10 +562,17 @@ class Dashboard(QtWidgets.QMainWindow):
             self.warning_banner.setVisible(False)
             self.warning_label.setText("")
             return
-        parts = []
-        for s in violators:
-            parts.append(f"TOF {s.upper()} {states[s].upper()}")
-        self.warning_label.setText("  ⚠  " + "  •  ".join(parts) + "  ⚠  ")
+        # If the Arduino told us why it's latched, prefer that reason so
+        # the operator sees "EMERGENCY STOP" for estops and the sensor
+        # details for genuine TOF violations.
+        reason = (self.telem.latch_reason
+                  if hasattr(self, "telem") else "")
+        if reason == "estop":
+            text = "EMERGENCY STOP"
+        else:
+            parts = [f"TOF {s.upper()} {states[s].upper()}" for s in violators]
+            text = "  •  ".join(parts)
+        self.warning_label.setText("  ⚠  " + text + "  ⚠  ")
         self.warning_banner.setVisible(True)
         self.warning_banner.raise_()
         # Re-position in case the label grew and the sizeHint changed.
@@ -574,12 +582,24 @@ class Dashboard(QtWidgets.QMainWindow):
         states = self._warning_state
         violators = [s for s in ("up", "down") if states[s] != "ok"]
         self.warn_prompt.setVisible(bool(violators))
-        if violators:
-            sensor_list = ", ".join(s.upper() for s in violators)
-            self.warn_prompt_label.setText(
-                f"⚠  TOF {sensor_list} out of range — Arduino has stopped.\n"
-                "Run both_attach to recover."
-            )
+        if not violators:
+            return
+        sensor_list = ", ".join(s.upper() for s in violators)
+        # If the Arduino told us why it's latched, surface that reason so
+        # the operator knows whether it's a TOF violation or an estop.
+        reason = (self.telem.latch_reason
+                  if hasattr(self, "telem") else "")
+        if reason in ("up", "down"):
+            head = f"⚠  TOF {reason.upper()} out of range — Arduino has stopped.\n"
+        elif reason == "estop":
+            head = "⚠  EMERGENCY STOP — Arduino has stopped.\n"
+        elif violators:
+            head = f"⚠  TOF {sensor_list} out of range — Arduino has stopped.\n"
+        else:
+            head = "⚠  Arduino has stopped.\n"
+        self.warn_prompt_label.setText(
+            head + "Run both_attach to recover."
+        )
 
     def _on_run_both_attach(self):
         # This is the recovery path: send both_attach through the WS bus,
@@ -660,17 +680,30 @@ class Dashboard(QtWidgets.QMainWindow):
             self.telem.last_ack    = str(msg.get("ack", "NONE"))
             self.telem.received_at = time.time()
             self.telem.latched     = bool(msg.get("latched", False))
+            self.telem.latch_reason = str(msg.get("latch_reason", "")) if self.telem.latched else ""
         self.logger.log_telemetry(self.telem)
-        # When the Arduino confirms the latch has cleared (e.g. after the
-        # user clicks "Run both_attach"), force our local warning state to
-        # OK so the banner / prompt collapse immediately even if the TOF
-        # reading hasn't yet settled back into range. The next telemetry
-        # frame will re-evaluate thresholds normally.
         if not self.telem.latched:
+            # When the Arduino confirms the latch has cleared (e.g. after
+            # the user clicks "Run both_attach"), force our local warning
+            # state to OK so the banner / prompt collapse immediately even
+            # if the TOF reading hasn't yet settled back into range.
             for sensor in ("up", "down"):
                 if self._warning_state.get(sensor, "ok") != "ok":
                     self._set_warning(sensor, "ok",
                                       self.telem.tof_up if sensor == "up" else self.telem.tof_down)
+        else:
+            # Arduino-driven latch (e.g. estop, or a WARN: that the
+            # dashboard missed). Make sure the UI shows the warning
+            # state, but don't echo WARN: back to the bridge -- the
+            # Arduino already knows.
+            reason = self.telem.latch_reason or "unknown"
+            if self._warning_state.get("up", "ok") == "ok":
+                self._warning_state["up"] = "low"
+                self._refresh_banner()
+                self._refresh_warn_prompt()
+                self._add_log(f"Arduino latched (reason: {reason}). "
+                              "Click 'Run both_attach' to recover.")
+                self.logger.log_event(f"arduino_latched={reason}")
         # Check TOF thresholds outside the lock so we don't hold it while
         # fiddling with widgets. Edge-triggered: only logs on the transition.
         self._check_tof_thresholds(self.telem.tof_up, self.telem.tof_down)
@@ -744,6 +777,21 @@ class Dashboard(QtWidgets.QMainWindow):
         self.ws.send(payload)
         self._add_log(f"Manual cmd sent: {cmd_name}")
         self.logger.log_event(f"manual_cmd={cmd_name}")
+        # Optimistically reflect estop on the UI before the Arduino's
+        # next status JSON arrives (up to 200 ms gap). The status JSON
+        # will confirm with latched:true, latch_reason:"estop".
+        if cmd_name == "estop":
+            if self._warning_state.get("up", "ok") == "ok":
+                self._warning_state["up"] = "low"
+                # Surface the latch_reason locally so the banner and
+                # prompt render with the estop-specific copy on the very
+                # next refresh tick instead of waiting on telemetry.
+                self.telem.latched = True
+                self.telem.latch_reason = "estop"
+                self._refresh_banner()
+                self._refresh_warn_prompt()
+                self._add_log("E-stop sent: Arduino will latch.")
+                self.logger.log_event("estop_sent")
 
     # ---------- Refresh ----------
     def _refresh_labels(self):

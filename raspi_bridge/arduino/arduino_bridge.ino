@@ -24,6 +24,13 @@
  *                           non-NONE command, which clears the latch and
  *                           runs normally.
  *
+ *   estop                 - sent as "0,FORWARD,estop". Immediately
+ *                           stops the drive motors and latches with
+ *                           latch_reason="estop". Recovery is the same
+ *                           as WARN: click "Run both_attach" in the
+ *                           dashboard; the first inbound non-NONE
+ *                           command clears the latch and runs.
+ *
  * Wire the sensors on the Arduino's I2C bus (the Wire already started in
  * sketch_jul30 setup()):
  *   - VL53L0X up       XSHUT on A1, INT -> NC
@@ -315,6 +322,18 @@ void executeCommand(String cmd) {
   }
   else if (cmd == "both_detach") {
     both_detach();
+  }
+  else if (cmd == "estop") {
+    // Emergency stop: kill drive motors immediately and engage the
+    // safety latch so the gamepad's 30 Hz drive stream can't re-arm
+    // them. Servos are intentionally left in place -- the operator
+    // clicks "Run both_attach" to recover, which clears the latch
+    // and moves the gripper into the safe pose in one step.
+    motor_drive.stop();
+    digitalWrite(ledPin, LOW);
+    latched = true;
+    strncpy(latch_reason, "estop", sizeof(latch_reason) - 1);
+    latch_reason[sizeof(latch_reason) - 1] = '\0';
   }
   else {
     // Unknown command: ACK so the dashboard doesn't sit idle, but don't
