@@ -185,7 +185,22 @@ class SerialBus:
 
     @staticmethod
     def _to_csv(text: str) -> Optional[str]:
-        """Coerce any inbound to '<speed>,<dir>,<cmd>\n'. Returns None on bad input."""
+        """Coerce any inbound to a serial line the Arduino understands.
+
+        Returns one of:
+          - '<speed>,<dir>,<cmd>\\n'        (CSV command)
+          - 'WARN:<sensor>\\n'              (safety latch trigger)
+          - None                            (unrecognized -> caller drops)
+        """
+        text = text.strip()
+        if not text:
+            return None
+        # Safety latch lines pass through unchanged.
+        if text.startswith("WARN:"):
+            sensor = text[5:].strip()
+            if sensor in ("up", "down"):
+                return text + "\n"
+            return None
         try:
             msg = json.loads(text)
             if isinstance(msg, dict):
@@ -198,12 +213,25 @@ class SerialBus:
                     speed = msg.get("speed", 0)
                     direction = msg.get("dir", "FORWARD")
                     command = msg.get("cmd", "NONE")
-                    return f"{int(speed)},{direction},{command}\n"
+                    if command in ("up_attach", "up_detach",
+                                   "down_attach", "down_detach",
+                                   "both_attach", "both_detach",
+                                   "estop", "NONE"):
+                        return f"{int(speed)},{direction},{command}\n"
+                    if command.startswith("WARN:") and command[5:] in ("up", "down"):
+                        return command + "\n"
         except json.JSONDecodeError:
             pass
         if SerialBus._looks_like_csv(text):
             return text + "\n"
         return None
+
+    _KNOWN_CSV_CMDS = frozenset({
+        "NONE", "up_attach", "up_detach",
+        "down_attach", "down_detach",
+        "both_attach", "both_detach",
+        "estop",
+    })
 
     @staticmethod
     def _looks_like_csv(text: str) -> bool:
@@ -214,7 +242,14 @@ class SerialBus:
             int(parts[0])
         except ValueError:
             return False
-        return parts[1] in ("FORWARD", "BACKWARD", "STOP")
+        if parts[1] not in ("FORWARD", "BACKWARD", "STOP"):
+            return False
+        # Reject obvious garbage like "150,FORWARD,WARN:up" -- WARN: has
+        # its own line shape. The Arduino would just ACK and ignore it,
+        # but rejecting here gives the operator a clear log line.
+        if parts[2].startswith("WARN:") or parts[2].startswith("ACK:"):
+            return False
+        return True
 
     # ---- Outbound (from Arduino -> WS) ----
     async def _broadcast(self, payload: dict):
@@ -272,6 +307,7 @@ class SerialBus:
                 "dir": "FORWARD",
                 "pose": "parallel",
                 "ack": "NONE",
+                "latched": False,
                 "tof": {
                     "up": 350 + int(5 * (t % 3)),
                     "down": 120 + int(5 * (t % 4)),

@@ -45,6 +45,17 @@ HTTP_STREAM  = f"http://{DEFAULT_HOST}:8080/stream"
 LOG_DIR      = Path.home() / "Documents" / "ClimbingRobotLogs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+# TOF safety thresholds, in millimetres. A reading outside [min, max] raises
+# the top-right warning banner. Defaults cover the normal operating range for
+# the climbing robot: closer than 30 mm means the gripper has already hit
+# the bar, farther than 300 mm means the sensor has lost the bar. Override
+# at the command line:
+#   python3 mac_dashboard.py --tof-up-min 40 --tof-down-max 280
+TOF_UP_MIN_MM   = 30
+TOF_UP_MAX_MM   = 300
+TOF_DOWN_MIN_MM = 30
+TOF_DOWN_MAX_MM = 300
+
 
 # ---------------------------- Telemetry state ----------------------------
 @dataclass
@@ -56,6 +67,7 @@ class Telemetry:
     bar_pose: str = "parallel"
     last_ack: str = "NONE"
     received_at: float = 0.0
+    latched: bool = False
 
 
 # ---------------------------- Async WS client (subscribe-only) ----------------------------
@@ -240,7 +252,7 @@ class SessionLogger:
             csv.writer(f).writerow([
                 "host_t_ms",
                 "tof_up_mm", "tof_down_mm",
-                "speed", "direction", "bar_pose", "last_ack",
+                "speed", "direction", "bar_pose", "last_ack", "latched",
             ])
         self._lock = Lock()
 
@@ -251,6 +263,7 @@ class SessionLogger:
                     int(time.time() * 1000),
                     t.tof_up, t.tof_down,
                     t.drive_speed, t.direction, t.bar_pose, t.last_ack,
+                    int(t.latched),
                 ])
             with open(self.jsonl_path, "a") as f:
                 f.write(json.dumps({
@@ -261,6 +274,7 @@ class SessionLogger:
                         "direction": t.direction,
                         "bar_pose": t.bar_pose,
                         "last_ack": t.last_ack,
+                        "latched": t.latched,
                     },
                 }) + "\n")
 
@@ -272,14 +286,42 @@ class SessionLogger:
 
 # ---------------------------- Main window ----------------------------
 class Dashboard(QtWidgets.QMainWindow):
-    def __init__(self, host: str):
+    def __init__(self, host: str,
+                 tof_up_min: int = TOF_UP_MIN_MM,
+                 tof_up_max: int = TOF_UP_MAX_MM,
+                 tof_down_min: int = TOF_DOWN_MIN_MM,
+                 tof_down_max: int = TOF_DOWN_MAX_MM):
         super().__init__()
         self.host = host
+        self.tof_up_min   = tof_up_min
+        self.tof_up_max   = tof_up_max
+        self.tof_down_min = tof_down_min
+        self.tof_down_max = tof_down_max
         self.logger = SessionLogger(LOG_DIR)
         self.telem = Telemetry()
         self.telem_lock = Lock()
         self._connected = False
         self._recording = False
+        # Tracks which sensor is currently in violation so we only emit a
+        # log entry on the rising and falling edges.
+        self._warning_state: dict[str, str] = {"up": "ok", "down": "ok"}
+        # The Arduino ships 0 mm before its first valid TOF sample; we treat
+        # those as "no data yet" rather than a violation. Once we've seen
+        # any non-zero reading from a sensor, 0 means a real out-of-range
+        # event and the warning machinery kicks in normally.
+        self._tof_seen: dict[str, bool] = {"up": False, "down": False}
+        # Quiet period after the operator clicks "Run both_attach": the
+        # servos move for ~800 ms (delay_to_pose on the Arduino) and the
+        # TOF readings swing through out-of-range values as the gripper
+        # re-positions. Suppress warning-state churn during that window so
+        # the banner doesn't flicker between ok and bad mid-recovery.
+        self._recovery_quiet_until: float = 0.0
+        # When the operator clicks "Test warning", we want the dashboard
+        # to stay in the warning state until they click 'Run both_attach',
+        # even if real telemetry reports in-range values (because the
+        # physical robot hasn't actually moved). Suppress threshold checks
+        # entirely while this flag is set.
+        self._test_warn_active: bool = False
 
         self._setup_ui()
         self._setup_networking()
@@ -295,6 +337,26 @@ class Dashboard(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         layout = QtWidgets.QHBoxLayout(central)
+
+        # ----- Top-right warning banner (overlays everything) -----
+        self.warning_banner = QtWidgets.QFrame(central)
+        self.warning_banner.setObjectName("warning_banner")
+        self.warning_banner.setStyleSheet(
+            "#warning_banner{background:#c33;color:white;border:2px solid #fff;"
+            "border-radius:6px;padding:8px 12px;font-weight:bold}"
+            "#warning_banner QLabel{color:white;background:transparent;"
+            "border:none;font-family:Menlo,monospace;font-size:12px}"
+        )
+        self.warning_banner.setVisible(False)
+        banner_layout = QtWidgets.QVBoxLayout(self.warning_banner)
+        banner_layout.setContentsMargins(0, 0, 0, 0)
+        self.warning_label = QtWidgets.QLabel("", self.warning_banner)
+        self.warning_label.setAlignment(QtCore.Qt.AlignCenter)
+        banner_layout.addWidget(self.warning_label)
+        # Position in the top-right corner with a small margin. The banner
+        # stays put when the window is resized via resizeEvent().
+        self._banner_margin = 12
+        self._reposition_banner()
 
         # ----- Left: video -----
         left = QtWidgets.QWidget()
@@ -337,9 +399,51 @@ class Dashboard(QtWidgets.QMainWindow):
         self.lbl_tof_down  = QtWidgets.QLabel("----")
         for lbl in (self.lbl_tof_up, self.lbl_tof_down):
             lbl.setStyleSheet("font-family:Menlo,monospace;font-size:13px")
-        tof_layout.addRow("Front (mm)", self.lbl_tof_up)
-        tof_layout.addRow("Rear  (mm)", self.lbl_tof_down)
+        tof_layout.addRow("Up   (mm)", self.lbl_tof_up)
+        tof_layout.addRow("Down (mm)", self.lbl_tof_down)
+        # Show the active thresholds so the operator can see what the
+        # banner will fire at without opening the source.
+        self.lbl_tof_up_limits = QtWidgets.QLabel(
+            f"warns outside [{self.tof_up_min}, {self.tof_up_max}] mm"
+        )
+        self.lbl_tof_down_limits = QtWidgets.QLabel(
+            f"warns outside [{self.tof_down_min}, {self.tof_down_max}] mm"
+        )
+        for lbl in (self.lbl_tof_up_limits, self.lbl_tof_down_limits):
+            lbl.setStyleSheet("color:#888;font-size:10px")
+        tof_layout.addRow("", self.lbl_tof_up_limits)
+        tof_layout.addRow("", self.lbl_tof_down_limits)
         right_layout.addWidget(tof_box)
+
+        # Recovery prompt: shown only while at least one sensor is in
+        # violation. One-click path back to a safe state via both_attach.
+        self.warn_prompt = QtWidgets.QFrame(right)
+        self.warn_prompt.setObjectName("warn_prompt")
+        self.warn_prompt.setStyleSheet(
+            "#warn_prompt{background:#fff3cd;color:#333;border:2px solid #c33;"
+            "border-radius:6px;padding:10px}"
+            "#warn_prompt QLabel{background:transparent;border:none;"
+            "color:#333;font-family:Menlo,monospace;font-size:12px}"
+            "#warn_prompt QPushButton{background:#3a3;color:white;font-weight:bold;"
+            "padding:8px;border:none;border-radius:4px}"
+            "#warn_prompt QPushButton:hover{background:#4c4}"
+            "#warn_prompt QPushButton:pressed{background:#282}"
+        )
+        self.warn_prompt.setVisible(False)
+        prompt_layout = QtWidgets.QVBoxLayout(self.warn_prompt)
+        prompt_layout.setContentsMargins(0, 0, 0, 0)
+        prompt_layout.setSpacing(6)
+        self.warn_prompt_label = QtWidgets.QLabel(
+            "⚠  TOF out of range — Arduino has stopped.\n"
+            "Run both_attach to recover."
+        )
+        self.warn_prompt_label.setAlignment(QtCore.Qt.AlignCenter)
+        prompt_layout.addWidget(self.warn_prompt_label)
+        self.warn_prompt_button = QtWidgets.QPushButton("Run both_attach")
+        self.warn_prompt_button.setCursor(QtCore.Qt.PointingHandCursor)
+        self.warn_prompt_button.clicked.connect(self._on_run_both_attach)
+        prompt_layout.addWidget(self.warn_prompt_button)
+        right_layout.addWidget(self.warn_prompt)
 
         # Status (now with 4 new fields vs. v1)
         status_box = QtWidgets.QGroupBox("Status")
@@ -349,13 +453,16 @@ class Dashboard(QtWidgets.QMainWindow):
         self.lbl_pose    = QtWidgets.QLabel("parallel")
         self.lbl_ack     = QtWidgets.QLabel("—")
         self.lbl_active  = QtWidgets.QLabel("idle")
-        for lbl in (self.lbl_speed, self.lbl_dir, self.lbl_pose, self.lbl_ack, self.lbl_active):
+        self.lbl_latched = QtWidgets.QLabel("released")
+        for lbl in (self.lbl_speed, self.lbl_dir, self.lbl_pose, self.lbl_ack,
+                    self.lbl_active, self.lbl_latched):
             lbl.setStyleSheet("font-family:Menlo,monospace;font-size:13px")
         status_layout.addRow("Drive speed", self.lbl_speed)
         status_layout.addRow("Direction",   self.lbl_dir)
         status_layout.addRow("Bar pose",    self.lbl_pose)
         status_layout.addRow("Last ACK",    self.lbl_ack)
         status_layout.addRow("State",       self.lbl_active)
+        status_layout.addRow("Safety",      self.lbl_latched)
         right_layout.addWidget(status_box)
 
         # Manual commands (kept; routes through WS bus)
@@ -374,6 +481,20 @@ class Dashboard(QtWidgets.QMainWindow):
         estop.setStyleSheet("background:#c33;color:white;font-weight:bold;padding:6px")
         estop.clicked.connect(lambda: self._send_manual("estop"))
         cmd_layout.addWidget(estop, 3, 0, 1, 2)
+        # Self-test: triggers the full WARN pipeline (dashboard -> bridge
+        # -> Arduino latch) without touching the physical TOF sensors.
+        # Useful for verifying the recovery flow on a fresh setup.
+        self.test_warn_button = QtWidgets.QPushButton("Test warning (WARN:up)")
+        self.test_warn_button.setStyleSheet(
+            "background:#e8a000;color:#222;font-weight:bold;padding:6px"
+        )
+        self.test_warn_button.setToolTip(
+            "Sends WARN:up to the bridge. The Arduino should latch, the\n"
+            "banner + prompt should appear, and clicking 'Run both_attach'\n"
+            "should clear the latch and return the dashboard to normal."
+        )
+        self.test_warn_button.clicked.connect(self._on_test_warning)
+        cmd_layout.addWidget(self.test_warn_button, 4, 0, 1, 2)
         right_layout.addWidget(cmd_box)
 
         right_layout.addStretch()
@@ -395,6 +516,112 @@ class Dashboard(QtWidgets.QMainWindow):
 
     def _add_log(self, msg: str):
         self.log_view.appendPlainText(f"{time.strftime('%H:%M:%S')}  {msg}")
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        # Keep the warning banner pinned to the top-right corner.
+        self._reposition_banner()
+
+    def _reposition_banner(self):
+        bw = self.warning_banner.sizeHint().width()
+        bh = self.warning_banner.sizeHint().height()
+        m = self._banner_margin
+        self.warning_banner.setGeometry(
+            self.width() - bw - m, m, bw, bh
+        )
+
+    def _set_warning(self, sensor: str, state: str, value: int):
+        """sensor: 'up' or 'down'; state: 'ok' / 'low' / 'high'."""
+        prev = self._warning_state.get(sensor, "ok")
+        if state == prev:
+            return
+        self._warning_state[sensor] = state
+        self._refresh_banner()
+        self._refresh_warn_prompt()
+        # Log edge transitions only -- never per-frame.
+        if state == "ok":
+            self._add_log(f"TOF {sensor} OK ({value} mm)")
+            self.logger.log_event(f"tof_{sensor}_ok={value}")
+        else:
+            self._add_log(
+                f"TOF {sensor} {state.upper()} ({value} mm) "
+                f"outside [{self.tof_up_min if sensor == 'up' else self.tof_down_min}, "
+                f"{self.tof_up_max if sensor == 'up' else self.tof_down_max}] mm"
+            )
+            self.logger.log_event(f"tof_{sensor}_{state}={value}")
+            # Tell the Arduino to latch. The Pi bridge forwards this as a
+            # raw "WARN:<sensor>\n" line.
+            self.ws.send(f"WARN:{sensor}")
+            self._add_log(f"Sent WARN:{sensor} to Arduino (latch engaged)")
+
+    def _refresh_banner(self):
+        states = self._warning_state
+        violators = [s for s in ("up", "down") if states[s] != "ok"]
+        if not violators:
+            self.warning_banner.setVisible(False)
+            self.warning_label.setText("")
+            return
+        parts = []
+        for s in violators:
+            parts.append(f"TOF {s.upper()} {states[s].upper()}")
+        self.warning_label.setText("  ⚠  " + "  •  ".join(parts) + "  ⚠  ")
+        self.warning_banner.setVisible(True)
+        self.warning_banner.raise_()
+        # Re-position in case the label grew and the sizeHint changed.
+        self._reposition_banner()
+
+    def _refresh_warn_prompt(self):
+        states = self._warning_state
+        violators = [s for s in ("up", "down") if states[s] != "ok"]
+        self.warn_prompt.setVisible(bool(violators))
+        if violators:
+            sensor_list = ", ".join(s.upper() for s in violators)
+            self.warn_prompt_label.setText(
+                f"⚠  TOF {sensor_list} out of range — Arduino has stopped.\n"
+                "Run both_attach to recover."
+            )
+
+    def _on_run_both_attach(self):
+        # This is the recovery path: send both_attach through the WS bus,
+        # which (a) executes the bar-pose command on the Arduino, and (b)
+        # is the first non-NONE command the latched Arduino will see, so
+        # it also clears the latch.
+        self._recovery_quiet_until = time.monotonic() + 1.5  # cover delay_to_pose
+        # Releasing the test-warning latch: real telemetry takes over
+        # threshold checks again on the next frame.
+        self._test_warn_active = False
+        self._send_manual("both_attach")
+        self._add_log("Recovery: requested both_attach; latch should clear "
+                      "on the next Arduino status frame.")
+        self.logger.log_event("recovery_both_attach_requested")
+
+    def _on_test_warning(self):
+        # Self-test for the full WARN pipeline. Drives the dashboard's
+        # warning state machine into a forced-low state for the up
+        # sensor. The rising edge inside _set_warning sends WARN:up to
+        # the bridge, the Arduino latches for real, and the next status
+        # JSON confirms with latched=true.
+        # If the warning is already active, do nothing -- clicking the
+        # button repeatedly would just spam the bridge.
+        if self._warning_state.get("up", "ok") != "ok":
+            self._add_log("Test warning: already active; click 'Run "
+                          "both_attach' to clear first.")
+            return
+        # Use a fabricated value one below the configured minimum so the
+        # log entry on the rising edge reads as a real low reading.
+        simulated = self.tof_up_min - 1
+        # Mark the sensor as "seen" so the bootstrap-suppression path
+        # doesn't neutralize our synthetic value.
+        self._tof_seen["up"] = True
+        # Freeze the threshold check until the operator recovers --
+        # otherwise the next real telemetry frame could immediately undo
+        # the synthetic warning state.
+        self._test_warn_active = True
+        self._set_warning("up", "low", simulated)
+        self._add_log("Test warning: forced TOF up into 'low' state; "
+                      "WARN:up sent to bridge. Click 'Run both_attach' "
+                      "to recover.")
+        self.logger.log_event("test_warning_triggered")
 
     # ---------- Networking ----------
     def _setup_networking(self):
@@ -432,7 +659,53 @@ class Dashboard(QtWidgets.QMainWindow):
             self.telem.bar_pose    = str(msg.get("pose", "parallel"))
             self.telem.last_ack    = str(msg.get("ack", "NONE"))
             self.telem.received_at = time.time()
+            self.telem.latched     = bool(msg.get("latched", False))
         self.logger.log_telemetry(self.telem)
+        # When the Arduino confirms the latch has cleared (e.g. after the
+        # user clicks "Run both_attach"), force our local warning state to
+        # OK so the banner / prompt collapse immediately even if the TOF
+        # reading hasn't yet settled back into range. The next telemetry
+        # frame will re-evaluate thresholds normally.
+        if not self.telem.latched:
+            for sensor in ("up", "down"):
+                if self._warning_state.get(sensor, "ok") != "ok":
+                    self._set_warning(sensor, "ok",
+                                      self.telem.tof_up if sensor == "up" else self.telem.tof_down)
+        # Check TOF thresholds outside the lock so we don't hold it while
+        # fiddling with widgets. Edge-triggered: only logs on the transition.
+        self._check_tof_thresholds(self.telem.tof_up, self.telem.tof_down)
+
+    def _check_tof_thresholds(self, up_mm: int, down_mm: int):
+        # While a test warning is in flight, freeze the dashboard's
+        # warning state. The operator has explicitly asked the dashboard
+        # to show the warning; we shouldn't undo that just because real
+        # telemetry happens to be in range.
+        if self._test_warn_active:
+            return
+        # During the recovery grace window, leave the warning state alone.
+        # The servos are mid-motion and TOF readings swing through bogus
+        # values; we'd otherwise flicker the banner through ok/low/ok/low.
+        if time.monotonic() < self._recovery_quiet_until:
+            return
+        # Mark sensors as "have we ever seen a non-zero reading?" Once true
+        # we trust that 0 is a real low reading rather than the Arduino's
+        # "not yet sampled" placeholder.
+        if up_mm > 0:
+            self._tof_seen["up"] = True
+        if down_mm > 0:
+            self._tof_seen["down"] = True
+
+        def state_for(sensor: str, value: int, lo: int, hi: int) -> str:
+            if value == 0 and not self._tof_seen[sensor]:
+                return "ok"  # No data yet — suppress the bootstrap flash.
+            if value < lo:
+                return "low"
+            if value > hi:
+                return "high"
+            return "ok"
+
+        self._set_warning("up",   state_for("up",   up_mm,   self.tof_up_min,   self.tof_up_max),   up_mm)
+        self._set_warning("down", state_for("down", down_mm, self.tof_down_min, self.tof_down_max), down_mm)
 
     def _on_ack(self, cmd: str):
         with self.telem_lock:
@@ -476,8 +749,21 @@ class Dashboard(QtWidgets.QMainWindow):
     def _refresh_labels(self):
         with self.telem_lock:
             t = self.telem
+        red = "color:#c33;font-weight:bold"
+        up_state = self._warning_state.get("up", "ok")
+        down_state = self._warning_state.get("down", "ok")
         self.lbl_tof_up.setText(str(t.tof_up))
+        self.lbl_tof_up.setStyleSheet(
+            f"font-family:Menlo,monospace;font-size:13px;{red}"
+            if up_state != "ok" else
+            "font-family:Menlo,monospace;font-size:13px"
+        )
         self.lbl_tof_down.setText(str(t.tof_down))
+        self.lbl_tof_down.setStyleSheet(
+            f"font-family:Menlo,monospace;font-size:13px;{red}"
+            if down_state != "ok" else
+            "font-family:Menlo,monospace;font-size:13px"
+        )
         self.lbl_speed.setText(str(t.drive_speed))
         self.lbl_dir.setText(t.direction)
         self.lbl_pose.setText(t.bar_pose)
@@ -485,6 +771,12 @@ class Dashboard(QtWidgets.QMainWindow):
         self.lbl_active.setText("ACTIVE" if t.drive_speed > 0 else "idle")
         self.lbl_active.setStyleSheet(
             "color:#3c3;font-weight:bold" if t.drive_speed > 0 else ""
+        )
+        self.lbl_latched.setText("LATCHED" if t.latched else "released")
+        self.lbl_latched.setStyleSheet(
+            "font-family:Menlo,monospace;font-size:13px;color:#c33;font-weight:bold"
+            if t.latched else
+            "font-family:Menlo,monospace;font-size:13px;color:#3c3"
         )
 
     def closeEvent(self, ev):
@@ -500,11 +792,25 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default=DEFAULT_HOST,
                         help="Pi AP IP (default 192.168.4.1)")
+    parser.add_argument("--tof-up-min", type=int, default=TOF_UP_MIN_MM,
+                        help="TOF up sensor lower limit in mm (default %(default)s)")
+    parser.add_argument("--tof-up-max", type=int, default=TOF_UP_MAX_MM,
+                        help="TOF up sensor upper limit in mm (default %(default)s)")
+    parser.add_argument("--tof-down-min", type=int, default=TOF_DOWN_MIN_MM,
+                        help="TOF down sensor lower limit in mm (default %(default)s)")
+    parser.add_argument("--tof-down-max", type=int, default=TOF_DOWN_MAX_MM,
+                        help="TOF down sensor upper limit in mm (default %(default)s)")
     args = parser.parse_args()
 
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
-    win = Dashboard(args.host)
+    win = Dashboard(
+        args.host,
+        tof_up_min=args.tof_up_min,
+        tof_up_max=args.tof_up_max,
+        tof_down_min=args.tof_down_min,
+        tof_down_max=args.tof_down_max,
+    )
     win.show()
     sys.exit(app.exec_())
 

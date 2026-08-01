@@ -64,7 +64,8 @@ Arduino -> Pi (line oriented, ASCII, 115200):
 
 ```
 STS:{...json...}\n        # 200 ms cadence
-ACK:<cmd>\n              # one-shot, when a command is executed
+ACK:<cmd>\n               # one-shot, when a command is executed
+WARNED:<sensor>\n         # echo of a WARN: line received (debug)
 ```
 
 Status JSON shape (one per 200 ms):
@@ -75,9 +76,16 @@ Status JSON shape (one per 200 ms):
   "dir": "FORWARD",
   "pose": "parallel",
   "ack": "up_attach",
+  "latched": false,
   "tof": {"up": 350, "down": 120}
 }
 ```
+
+When `latched` is `true` the Arduino is in the safety latch: drive
+motors are stopped at zero and incoming CSV `NONE` lines (gamepad
+drive updates) are ignored. The latch clears on the first inbound
+non-`NONE` command. `"latch_reason"` (only present while latched)
+records which sensor triggered it (`up` or `down`).
 
 Pi -> Arduino (CSV, newline terminated):
 
@@ -88,6 +96,21 @@ Pi -> Arduino (CSV, newline terminated):
 `direction` is `FORWARD` or `BACKWARD`. `cmd` is one of `NONE`,
 `up_attach`, `up_detach`, `down_attach`, `down_detach`, `both_attach`,
 `both_detach`, `estop`.
+
+Pi -> Arduino (safety latch, newline terminated):
+
+```
+WARN:up\n
+WARN:down\n
+```
+
+A `WARN:<sensor>` line immediately stops the drive motors and engages
+the safety latch. While latched, all inbound CSV is dropped until the
+next non-`NONE` command, which clears the latch and runs normally.
+The dashboard raises this line automatically when a TOF reading falls
+outside the configured limits; the operator recovers by clicking
+"Run both_attach" in the dashboard, which sends `both_attach` and
+clears the latch in one step.
 
 ## WebSocket protocol
 

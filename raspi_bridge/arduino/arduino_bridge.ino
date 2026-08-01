@@ -4,17 +4,25 @@
  *  - Motor control, servos, bar-pose logic: unchanged from sketch_jul30
  *  - Adds: 2x VL53L0X TOF read (up + down) via XSHUT re-addressing
  *  - Adds: 200 ms periodic JSON status exports with prefix "STS:"
+ *  - Adds: safety latch on `WARN:<sensor>` lines from the Pi
  *  - Keeps: existing `ACK:<cmd>` lines emitted only on command events
  *
  * Serial protocol on Arduino -> Pi (line oriented, ASCII):
  *   STS:{...json...}      - one per 200 ms (telemetry, with sensor data)
  *   ACK:<cmd>             - one per command event (e.g. ACK:up_attach)
+ *   WARNED:<sensor>       - one per WARN: line received (debug-only echo)
  *
  * Serial protocol on Pi -> Arduino (CSV line, newline-terminated):
  *   <speed>,<dir>,<cmd>   - e.g. "150,FORWARD,NONE\n"
  *   <dir> in {FORWARD, BACKWARD}
  *   <cmd> in {NONE, up_attach, up_detach, down_attach, down_detach,
  *             both_attach, both_detach, estop}
+ *
+ *   WARN:<sensor>         - e.g. "WARN:up\n"; immediately stops the
+ *                           drive motors and latches. While latched, all
+ *                           CSV lines are dropped until the next inbound
+ *                           non-NONE command, which clears the latch and
+ *                           runs normally.
  *
  * Wire the sensors on the Arduino's I2C bus (the Wire already started in
  * sketch_jul30 setup()):
@@ -39,6 +47,16 @@ VL53L0X          tof_down;
 volatile uint16_t tof_up_mm = 0;
 volatile uint16_t tof_down_mm  = 0;
 volatile bool     sensors_ok = false;
+
+// ===================== Safety latch =====================
+// When the Pi / dashboard raises a TOF warning, it sends a `WARN:up` or
+// `WARN:down` line. The Arduino stops the drive motors and latches: every
+// subsequent inbound CSV line is ignored (the dashboard stops motors, the
+// gamepad is still streaming at 30 Hz but nothing moves) until the next
+// inbound command (anything other than `NONE`) arrives, at which point the
+// latch clears and the command executes normally.
+bool     latched = false;
+char     latch_reason[16] = "";
 
 // ===================== Status export =====================
 unsigned long next_status_ms = 0;
@@ -130,7 +148,14 @@ void emitStatusLine() {
   Serial.print(current_bar_pose);
   Serial.print(F("\",\"ack\":\""));
   Serial.print(last_cmd);
-  Serial.print(F("\",\"tof\":{"
+  Serial.print(F("\",\"latched\":"));
+  Serial.print(latched ? "true" : "false");
+  if (latched) {
+    Serial.print(F(",\"latch_reason\":\""));
+    Serial.print(latch_reason);
+    Serial.print(F("\""));
+  }
+  Serial.print(F(",\"tof\":{"
                  "\"up\":"));
   Serial.print(tof_up_mm);
   Serial.print(F(",\"down\":"));
@@ -164,12 +189,16 @@ void setup() {
 
 // ===================== Main loop =====================
 void loop() {
-  // 1. Inbound commands
+  // 1. Inbound commands / warnings
   if (Serial.available() > 0) {
     String payload = Serial.readStringUntil('\n');
     payload.trim();
     if (payload.length() > 0) {
-      parseAndExecutePayload(payload);
+      if (payload.startsWith("WARN:")) {
+        parseAndExecuteWarning(payload);
+      } else {
+        parseAndExecutePayload(payload);
+      }
     }
   }
 
@@ -205,6 +234,20 @@ void parseAndExecutePayload(String payload) {
     String directionStr = payload.substring(firstComma + 1, secondComma);
     String commandStr   = payload.substring(secondComma + 1);
 
+    // Safety latch: while latched, ignore drive-only updates (NONE) so the
+    // robot stays stopped even while the gamepad keeps streaming. A real
+    // command clears the latch and runs normally -- that's the "next manual
+    // command" recovery path.
+    if (latched) {
+      if (commandStr == "NONE") {
+        // Drop silently: motors stay at zero, no ACK.
+        return;
+      }
+      // Clear the latch on the first inbound command and fall through.
+      latched = false;
+      latch_reason[0] = '\0';
+    }
+
     int speedVal = speedStr.toInt();
 
     // Mirror direction string for status output
@@ -217,6 +260,24 @@ void parseAndExecutePayload(String payload) {
       executeCommand(commandStr);
     }
   }
+}
+
+// ===================== Warning handler =====================
+void parseAndExecuteWarning(String payload) {
+  // payload looks like "WARN:up" or "WARN:down".
+  String sensor = payload.substring(5);
+  sensor.trim();
+  if (sensor != "up" && sensor != "down") {
+    return;
+  }
+  // Stop the drive motors immediately.
+  motor_drive.stop();
+  digitalWrite(ledPin, LOW);
+  latched = true;
+  strncpy(latch_reason, sensor.c_str(), sizeof(latch_reason) - 1);
+  latch_reason[sizeof(latch_reason) - 1] = '\0';
+  Serial.print(F("WARNED:"));
+  Serial.println(sensor);
 }
 
 void setDriveMotors(int speed, String direction){
