@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import json
 import glob
+import hmac
 import logging
 import os
 import signal
@@ -358,13 +359,77 @@ class SerialBus:
 
 # ---------------------------- Server ----------------------------
 class BridgeServer:
-    def __init__(self, bus: SerialBus):
+    def __init__(self, bus: SerialBus, auth_token: str = ""):
         self.bus = bus
+        # Empty token == no auth required (preserves the on-AP workflow
+        # where WPA2-PSK is the perimeter). Set --auth-token to require a
+        # bearer token on every WS upgrade -- required whenever the
+        # bridge is reachable over any network that isn't trusted
+        # (Tailscale, LTE, public WiFi).
+        self.auth_token = auth_token
+
+    async def _check_auth_at_handshake(self, path, request_headers):
+        """process_request hook: reject at HTTP-level with a real 401
+        if the token is missing or wrong, or a 404 if the path is
+        wrong. Returning an HTTP response here short-circuits the WS
+        handshake so the client sees a proper 401/404 instead of a
+        silently-closed WS connection.
+
+        websockets 12/13/14/15/16/17 all use the same signature:
+        ``process_request(path: str, request_headers: Headers)``.
+        """
+        url_path = path
+        headers = request_headers
+
+        if url_path != WS_PATH:
+            log.warning("Rejecting unknown path: %s", url_path)
+            return (
+                404,
+                [("Content-Type", "text/plain")],
+                b"not found\n",
+            )
+
+        if not self.auth_token:
+            return None  # auth disabled, path OK -> proceed
+
+        try:
+            presented = headers.get("Authorization", "")
+        except Exception:
+            presented = ""
+        if presented.startswith("Bearer ") and hmac.compare_digest(
+            presented[7:].strip(), self.auth_token
+        ):
+            return None  # accepted; proceed to WS handshake
+        log.warning("Auth rejected path=%s", url_path)
+        # websockets expects (status, headers_list, body) or None.
+        return (
+            401,
+            [("Content-Type", "text/plain"), ("WWW-Authenticate", "Bearer")],
+            b"unauthorized\n",
+        )
 
     async def __call__(self, ws):
         if ws.path != WS_PATH:
             await ws.close(code=1008, reason="unknown path")
             return
+        # Defense-in-depth: re-check the bearer inside the WS handler
+        # in case process_request was bypassed (older websockets
+        # versions that don't pass through our hook).
+        if self.auth_token:
+            headers = (
+                getattr(ws, "request_headers", None)
+                or getattr(ws, "headers", None)
+                or {}
+            )
+            try:
+                presented = headers.get("Authorization", "")
+            except Exception:
+                presented = ""
+            if not (presented.startswith("Bearer ")
+                    and hmac.compare_digest(
+                        presented[7:].strip(), self.auth_token)):
+                await ws.close(code=4401, reason="unauthorized")
+                return
         await self.bus.add_client(ws)
         try:
             async for raw in ws:
@@ -392,7 +457,29 @@ async def main():
         help="Seconds to wait for the Arduino before giving up / falling "
              "back. Use -1 to wait forever (default 60).",
     )
+    ap.add_argument(
+        "--auth-token", default=os.environ.get("BRIDGE_AUTH_TOKEN", ""),
+        help="Require clients to send `Authorization: Bearer <token>` on "
+             "the WS upgrade. Defaults to env var BRIDGE_AUTH_TOKEN. "
+             "Empty (default) disables auth -- required when exposing "
+             "the bridge over any untrusted network (Tailscale, LTE).",
+    )
+    ap.add_argument(
+        "--no-tailscale", "--direct", action="store_true",
+        help="Operator explicit opt-out of the Tailscale layer. With "
+             "this flag set, --auth-token (and $BRIDGE_AUTH_TOKEN) are "
+             "silently ignored -- the bridge binds 0.0.0.0 with no "
+             "bearer required. Use this when driving the robot over a "
+             "direct IP you already trust (the home AP, a known LAN).",
+    )
     args = ap.parse_args()
+
+    if args.no_tailscale and args.auth_token:
+        # Silent: --no-tailscale wins, as agreed in the design call.
+        log.warning(
+            "--no-tailscale set; ignoring --auth-token and BRIDGE_AUTH_TOKEN"
+        )
+        args.auth_token = ""
 
     # /etc/default/climbingrobot can force mock mode at startup.
     env_force_test = os.environ.get("TEST_MODE", "0") == "1"
@@ -429,7 +516,7 @@ async def main():
     bus = SerialBus(port, args.baud, test_mode)
     await bus.start()
 
-    server = BridgeServer(bus)
+    server = BridgeServer(bus, auth_token=args.auth_token)
     stop = asyncio.Event()
 
     def _sig(*_):
@@ -443,9 +530,19 @@ async def main():
             pass
 
     mode = "MOCK" if test_mode else f"real serial {port}"
-    log.info("WebSocket server on ws://%s:%d%s  (%s)",
-             WS_HOST, args.port, WS_PATH, mode)
-    async with ws_serve(server, WS_HOST, args.port, max_size=64 * 1024):
+    auth_state = "ENABLED" if args.auth_token else "DISABLED (open)"
+    tailscale_state = "off (--no-tailscale)" if args.no_tailscale else "on"
+    log.info(
+        "WebSocket server on ws://%s:%d%s  (%s)  auth=%s  tailscale=%s",
+        WS_HOST, args.port, WS_PATH, mode, auth_state, tailscale_state,
+    )
+    async with ws_serve(
+        server,
+        WS_HOST,
+        args.port,
+        max_size=64 * 1024,
+        process_request=server._check_auth_at_handshake,
+    ):
         await stop.wait()
     await bus.stop()
 

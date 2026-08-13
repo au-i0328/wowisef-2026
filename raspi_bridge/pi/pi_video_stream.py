@@ -236,7 +236,18 @@ def main():
     ap.add_argument("--wait-device", default="60", type=float,
                     help="Seconds to wait for the webcam before falling back "
                          "or giving up. Use -1 to wait forever (default 60).")
+    ap.add_argument(
+        "--no-tailscale", "--direct", action="store_true",
+        help="Operator explicit opt-out of the Tailscale layer. The "
+             "video stream is plain HTTP and unauthenticated today in "
+             "all modes; this flag documents that the operator is "
+             "intentionally using a directly-trusted connection (home "
+             "AP, known LAN) rather than the Tailscale mesh.")
     args = ap.parse_args()
+
+    if args.no_tailscale:
+        log.info("--no-tailscale set; binding 0.0.0.0:8080 over a "
+                 "directly-trusted connection (no TLS, no auth)")
 
     # /etc/default/climbingrobot can force mock mode at startup.
     env_force_test = os.environ.get("TEST_MODE", "0") == "1"

@@ -81,8 +81,10 @@ def get_21_channels(pad):
 class PiLink:
     """Maintains a single persistent WS connection to the Pi bus."""
 
-    def __init__(self, host: str, port: int, path: str = "/bus"):
+    def __init__(self, host: str, port: int, path: str = "/bus",
+                 auth_token: str = ""):
         self.url = f"ws://{host}:{port}{path}"
+        self.auth_token = auth_token
         self.ws: Optional[object] = None
         self._send_queue: asyncio.Queue = asyncio.Queue()
         self._stop = False
@@ -112,7 +114,12 @@ class PiLink:
         backoff = 1.0
         while not self._stop:
             try:
-                async with websockets.connect(self.url, ping_interval=20, ping_timeout=20) as ws:
+                connect_kwargs = {"ping_interval": 20, "ping_timeout": 20}
+                if self.auth_token:
+                    connect_kwargs["additional_headers"] = {
+                        "Authorization": f"Bearer {self.auth_token}",
+                    }
+                async with websockets.connect(self.url, **connect_kwargs) as ws:
                     self.ws = ws
                     self._connected_evt.set()
                     print(f"[ws] connected to {self.url}")
@@ -155,7 +162,8 @@ class PiLink:
 
 # ---------------------------- Main loop ----------------------------
 async def main_async(args):
-    link = PiLink(args.host, args.port, args.path)
+    link = PiLink(args.host, args.port, args.path,
+                  auth_token=getattr(args, "auth_token", ""))
     await link.start()
 
     if not args.test:
@@ -259,15 +267,34 @@ async def main_async(args):
 
 
 def main():
+    import os
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="pi.local", help="Pi AP IP")
     ap.add_argument("--port", default=81, type=int)
     ap.add_argument("--path", default="/bus")
+    ap.add_argument("--auth-token",
+                    default=os.environ.get("BRIDGE_AUTH_TOKEN", ""),
+                    help="Bearer token for the WS bridge (must match the "
+                         "bridge's --auth-token / BRIDGE_AUTH_TOKEN). "
+                         "Defaults to env var BRIDGE_AUTH_TOKEN.")
+    ap.add_argument(
+        "--no-tailscale", "--direct", action="store_true",
+        help="Operator explicit opt-out of the Tailscale layer. With "
+             "this flag set, --auth-token (and $BRIDGE_AUTH_TOKEN) are "
+             "silently ignored -- the gamepad sender connects to --host "
+             "with no bearer header. Use this when the Pi is on a "
+             "directly-trusted LAN.")
     ap.add_argument("--test", action="store_true",
                     help="Synthesize drive commands (no controller / no WS)")
     ap.add_argument("--pretty", action="store_true",
                     help="Send JSON envelopes instead of raw CSV")
     args = ap.parse_args()
+
+    if args.no_tailscale and args.auth_token:
+        # Silent: --no-tailscale wins, as agreed in the design call.
+        print("[gamepad] --no-tailscale set; ignoring --auth-token",
+              file=sys.stderr)
+        args.auth_token = ""
 
     try:
         asyncio.run(main_async(args))

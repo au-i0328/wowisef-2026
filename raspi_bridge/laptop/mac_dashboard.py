@@ -26,8 +26,12 @@ import argparse
 import asyncio
 import csv
 import json
+import shutil
+import subprocess
 import sys
 import time
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock, Thread
@@ -39,9 +43,8 @@ import websockets
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 # ---------------------------- Configuration ----------------------------
-DEFAULT_HOST = "pi.local"
+DEFAULT_HOST = "pi.tailb01662.ts.net"
 WS_PATH      = "/bus"
-HTTP_STREAM  = f"http://{DEFAULT_HOST}:8080/stream"
 LOG_DIR      = Path.home() / "Documents" / "ClimbingRobotLogs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -52,9 +55,9 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 # at the command line:
 #   python3 mac_dashboard.py --tof-up-min 40 --tof-down-max 280
 TOF_UP_MIN_MM   = 30
-TOF_UP_MAX_MM   = 300
+TOF_UP_MAX_MM   = 400
 TOF_DOWN_MIN_MM = 30
-TOF_DOWN_MAX_MM = 300
+TOF_DOWN_MAX_MM = 400
 
 
 # ---------------------------- Telemetry state ----------------------------
@@ -79,11 +82,13 @@ class WsClient(QtCore.QObject):
     ack_received = QtCore.pyqtSignal(str)
     log          = QtCore.pyqtSignal(str)
 
-    def __init__(self, host: str, port: int = 81, path: str = WS_PATH):
+    def __init__(self, host: str, port: int = 81, path: str = WS_PATH,
+                 auth_token: str = ""):
         super().__init__()
         self.host = host
         self.port = port
         self.path = path
+        self.auth_token = auth_token
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[Thread] = None
         self._ws: Optional[object] = None
@@ -128,7 +133,12 @@ class WsClient(QtCore.QObject):
         backoff = 1.0
         while not self._stop:
             try:
-                async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                connect_kwargs = {"ping_interval": 20, "ping_timeout": 20}
+                if self.auth_token:
+                    connect_kwargs["additional_headers"] = {
+                        "Authorization": f"Bearer {self.auth_token}",
+                    }
+                async with websockets.connect(url, **connect_kwargs) as ws:
                     self._ws = ws
                     self._connected = True
                     self.connected.emit()
@@ -173,18 +183,42 @@ class WsClient(QtCore.QObject):
 
 # ---------------------------- Video worker ----------------------------
 class VideoWorker(QtCore.QObject):
-    """Pulls MJPEG from the Pi, decodes, optionally writes mp4."""
+    """Pulls MJPEG from the Pi, decodes, optionally writes a recoverable
+    on-disk recording.
+
+    Recording strategy (macOS-safe):
+      * Measure actual incoming FPS over a rolling 1s window and stamp
+        that value into the AVI header so QuickTime/VLC play the file
+        back at the correct rate. OpenCV's MJPG writer otherwise
+        embeds whatever fps you pass it -- which we don't really know
+        up front, since the Pi's stream rate varies with load.
+      * Write frames with the MJPG fourcc into <session_dir>/video.tmp.avi.
+        MJPG is the only codec OpenCV's default build supports on every
+        platform, so frames always land on disk -- no silent 44-byte stub.
+      * On stop, transcode the AVI to H.264 MP4 with ffmpeg if available
+        (hardware-accelerated, plays in QuickTime). If ffmpeg is missing,
+        fall back to renaming the AVI to .mp4 so the recording is still
+        recoverable, even though QuickTime won't play MJPG.
+    """
     frame  = QtCore.pyqtSignal(np.ndarray)
     log    = QtCore.pyqtSignal(str)
+    # stats: dict with keys fps (float, live measured), src_fps (float, what
+    # the source reports), width, height, frames_written (int), recording (bool)
+    stats  = QtCore.pyqtSignal(dict)
 
     def __init__(self, url: str, save_path: Path):
         super().__init__()
         self.url = url
-        self.save_path = save_path
+        self.save_path = Path(save_path)
+        # The final on-disk artifact lives at save_path; the in-progress
+        # recording lives at save_tmp until transcode at stop.
+        self.save_tmp = self.save_path.with_suffix(".tmp.avi")
         self._stop = False
         self._recording = False
         self._writer: Optional[cv2.VideoWriter] = None
+        self._writer_fps: float = 0.0
         self._thread: Optional[Thread] = None
+        self._frames_written = 0
 
     def start(self):
         self._thread = Thread(target=self._run, daemon=True)
@@ -196,6 +230,16 @@ class VideoWorker(QtCore.QObject):
     def set_recording(self, on: bool):
         self._recording = on
 
+    def _emit_stats(self, fps: float, src_fps: float, w: int, h: int):
+        self.stats.emit({
+            "fps": fps,
+            "src_fps": src_fps,
+            "width": w,
+            "height": h,
+            "frames_written": self._frames_written,
+            "recording": self._recording,
+        })
+
     def _run(self):
         cap: Optional[cv2.VideoCapture] = None
         for try_url in (self.url,):
@@ -203,7 +247,14 @@ class VideoWorker(QtCore.QObject):
                 c = cv2.VideoCapture(try_url)
                 if c.isOpened():
                     cap = c
-                    self.log.emit(f"Video source: {try_url}")
+                    src_fps = float(c.get(cv2.CAP_PROP_FPS) or 0.0)
+                    src_w = int(c.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                    src_h = int(c.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                    self.log.emit(
+                        f"Video source: {try_url} "
+                        f"(reported {src_w}x{src_h} @ {src_fps:.1f} fps)"
+                    )
+                    self._emit_stats(0.0, src_fps, src_w, src_h)
                     break
                 c.release()
             except Exception:
@@ -212,14 +263,30 @@ class VideoWorker(QtCore.QObject):
             self.log.emit("Video: failed to open stream")
             return
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        # Rolling 1s fps window.
+        window_s = 1.0
+        frame_times: list[float] = []
         last_size: Optional[tuple[int, int]] = None
-        fps_out = 20.0
+        # Pre-roll delay before locking in the recording fps: enough
+        # samples to estimate fps, not so long that we drop frames.
+        fps_lock_after_s = 0.5
+        recording_started_at: Optional[float] = None
+
         while not self._stop:
             ok, frame = cap.read()
             if not ok or frame is None:
                 time.sleep(0.02)
                 continue
+            now = time.monotonic()
+            frame_times.append(now)
+            # Drop samples older than the rolling window.
+            while frame_times and now - frame_times[0] > window_s:
+                frame_times.pop(0)
+            live_fps = (len(frame_times) - 1) / window_s if len(frame_times) > 1 else 0.0
+
             self.frame.emit(frame)
+
             if self._recording:
                 h, w = frame.shape[:2]
                 if last_size != (w, h):
@@ -227,15 +294,138 @@ class VideoWorker(QtCore.QObject):
                         self._writer.release()
                         self._writer = None
                     last_size = (w, h)
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    recording_started_at = now
+                    # Tentative writer at 20 fps; we'll reopen it at the
+                    # measured rate once the pre-roll window has filled
+                    # so VLC plays the file at the real rate.
+                    self._writer_fps = 20.0
+                    # MJPG fourcc is universally supported by OpenCV's
+                    # bundled builds. The intermediate AVI may be large
+                    # (~ a few MB/s), but it's flushed to disk every
+                    # frame, so a crash or kill never loses the take.
+                    fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+                    # Remove any stale partial from a previous crash.
+                    if self.save_tmp.exists():
+                        try:
+                            self.save_tmp.unlink()
+                        except OSError:
+                            pass
                     self._writer = cv2.VideoWriter(
-                        str(self.save_path), fourcc, fps_out, (w, h)
+                        str(self.save_tmp), fourcc, self._writer_fps, (w, h)
                     )
+                    if not self._writer.isOpened():
+                        self.log.emit(
+                            f"VideoWriter failed to open {self.save_tmp} -- "
+                            "recording disabled for this session"
+                        )
+                        self._writer = None
+                elif (
+                    self._writer
+                    and recording_started_at is not None
+                    and now - recording_started_at > fps_lock_after_s
+                    and live_fps > 0
+                    and abs(live_fps - self._writer_fps) > 0.5
+                ):
+                    # After the pre-roll, reopen the writer at the
+                    # measured fps so the AVI header carries the real
+                    # rate. We re-open (rather than mutating CAP_PROP)
+                    # because OpenCV's MJPG writer doesn't let you
+                    # change fps mid-stream.
+                    self._writer.release()
+                    fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+                    self._writer_fps = max(1.0, round(live_fps, 2))
+                    self._writer = cv2.VideoWriter(
+                        str(self.save_tmp), fourcc, self._writer_fps, (w, h)
+                    )
+                    if not self._writer.isOpened():
+                        self.log.emit(
+                            f"VideoWriter failed to reopen at "
+                            f"{self._writer_fps:.2f} fps -- continuing "
+                            "at original rate"
+                        )
                 if self._writer:
                     self._writer.write(frame)
+                    self._frames_written += 1
+                self._emit_stats(live_fps, src_fps, w, h)
+            else:
+                # Throttle stats to ~5 Hz to keep the GUI snappy.
+                if not hasattr(self, "_last_emit") or now - self._last_emit > 0.2:
+                    self._last_emit = now
+                    self._emit_stats(live_fps, src_fps,
+                                     int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0),
+                                     int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0))
+
         if self._writer:
             self._writer.release()
+            self._writer = None
         cap.release()
+        # Transcode the on-disk recording to a playable MP4 if ffmpeg is
+        # available; otherwise just rename the AVI so the file is at
+        # least recoverable. We do this even on stop-without-recording
+        # because a previous recording may have left a tmp file behind.
+        if self.save_tmp.exists():
+            self._finalize_recording()
+
+    def _finalize_recording(self):
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg:
+            self.log.emit(
+                f"Transcoding AVI -> H.264 MP4 with ffmpeg "
+                f"(recorded at {self._writer_fps:.2f} fps)…"
+            )
+            try:
+                # -y overwrites the target if present.
+                # -loglevel error keeps the log panel quiet.
+                # We pass -r so the output is unambiguously stamped too.
+                result = subprocess.run(
+                    [
+                        ffmpeg, "-y", "-loglevel", "error",
+                        "-r", f"{self._writer_fps:.3f}",
+                        "-i", str(self.save_tmp),
+                        "-c:v", "libx264", "-preset", "veryfast",
+                        "-crf", "23",
+                        "-r", f"{self._writer_fps:.3f}",
+                        "-movflags", "+faststart",
+                        str(self.save_path),
+                    ],
+                    capture_output=True, text=True, timeout=300,
+                )
+                if result.returncode == 0 and self.save_path.exists():
+                    try:
+                        self.save_tmp.unlink()
+                    except OSError:
+                        pass
+                    size = self.save_path.stat().st_size
+                    self.log.emit(f"Recording saved: {self.save_path} ({size//1024} KB)")
+                else:
+                    err = (result.stderr or "").strip().splitlines()[-3:]
+                    self.log.emit(
+                        f"ffmpeg transcode failed ({result.returncode}); "
+                        f"keeping AVI. Last stderr: {' | '.join(err)}"
+                    )
+                    self._rename_avi_fallback()
+            except subprocess.TimeoutExpired:
+                self.log.emit("ffmpeg timed out; keeping AVI as video.mp4")
+                self._rename_avi_fallback()
+            except Exception as e:
+                self.log.emit(f"ffmpeg error: {e}; keeping AVI as video.mp4")
+                self._rename_avi_fallback()
+        else:
+            self.log.emit(
+                "ffmpeg not installed; saving AVI as video.mp4 "
+                "(install ffmpeg for a smaller H.264 file)"
+            )
+            self._rename_avi_fallback()
+
+    def _rename_avi_fallback(self):
+        try:
+            if self.save_path.exists():
+                self.save_path.unlink()
+            self.save_tmp.rename(self.save_path)
+            size = self.save_path.stat().st_size
+            self.log.emit(f"Recording saved: {self.save_path} ({size//1024} KB)")
+        except OSError as e:
+            self.log.emit(f"Could not finalize recording: {e}")
 
 
 # ---------------------------- Logger ----------------------------
@@ -291,9 +481,11 @@ class Dashboard(QtWidgets.QMainWindow):
                  tof_up_min: int = TOF_UP_MIN_MM,
                  tof_up_max: int = TOF_UP_MAX_MM,
                  tof_down_min: int = TOF_DOWN_MIN_MM,
-                 tof_down_max: int = TOF_DOWN_MAX_MM):
+                 tof_down_max: int = TOF_DOWN_MAX_MM,
+                 auth_token: str = ""):
         super().__init__()
         self.host = host
+        self.auth_token = auth_token
         self.tof_up_min   = tof_up_min
         self.tof_up_max   = tof_up_max
         self.tof_down_min = tof_down_min
@@ -389,6 +581,10 @@ class Dashboard(QtWidgets.QMainWindow):
         self.conn_indicator = QtWidgets.QLabel("● Disconnected")
         self.conn_indicator.setStyleSheet("color:#c33;font-weight:bold")
         conn_row.addWidget(self.conn_indicator)
+        conn_row.addSpacing(12)
+        self.video_indicator = QtWidgets.QLabel("Video: --")
+        self.video_indicator.setStyleSheet("color:#888;font-weight:bold")
+        conn_row.addWidget(self.video_indicator)
         conn_row.addStretch()
         conn_row.addWidget(QtWidgets.QLabel(f"Host: {self.host}"))
         right_layout.addLayout(conn_row)
@@ -645,7 +841,7 @@ class Dashboard(QtWidgets.QMainWindow):
 
     # ---------- Networking ----------
     def _setup_networking(self):
-        self.ws = WsClient(self.host)
+        self.ws = WsClient(self.host, auth_token=self.auth_token)
         self.ws.connected.connect(self._on_ws_connected)
         self.ws.disconnected.connect(self._on_ws_disconnected)
         self.ws.telemetry.connect(self._on_telemetry)
@@ -653,9 +849,10 @@ class Dashboard(QtWidgets.QMainWindow):
         self.ws.log.connect(self._add_log)
         self.ws.start()
 
-        self.video = VideoWorker(HTTP_STREAM, self.logger.video_path)
+        self.video = VideoWorker(f"http://{self.host}:8080/stream", self.logger.video_path)
         self.video.frame.connect(self._on_frame)
         self.video.log.connect(self._add_log)
+        self.video.stats.connect(self._on_video_stats)
         self.video.start()
 
     def _on_ws_connected(self):
@@ -757,6 +954,23 @@ class Dashboard(QtWidgets.QMainWindow):
         )
         self.video_label.setPixmap(pix)
 
+    def _on_video_stats(self, s: dict):
+        w = s.get("width") or 0
+        h = s.get("height") or 0
+        fps = s.get("fps") or 0.0
+        frames = s.get("frames_written") or 0
+        rec = s.get("recording", False)
+        if w and h:
+            tail = f"  •  REC {frames}f" if rec else ""
+            self.video_indicator.setText(f"Video: {w}x{h} @ {fps:4.1f} fps{tail}")
+            # Green while receiving at any healthy rate; grey if the
+            # stream is essentially stalled.
+            color = "#3c3" if fps >= 5 else ("#c93" if fps >= 1 else "#888")
+            self.video_indicator.setStyleSheet(f"color:{color};font-weight:bold")
+        else:
+            self.video_indicator.setText("Video: connecting…")
+            self.video_indicator.setStyleSheet("color:#888;font-weight:bold")
+
     def _toggle_recording(self, on: bool):
         self._recording = on
         self.video.set_recording(on)
@@ -848,7 +1062,25 @@ def main():
                         help="TOF down sensor lower limit in mm (default %(default)s)")
     parser.add_argument("--tof-down-max", type=int, default=TOF_DOWN_MAX_MM,
                         help="TOF down sensor upper limit in mm (default %(default)s)")
+    parser.add_argument("--auth-token",
+                        default=os.environ.get("BRIDGE_AUTH_TOKEN", ""),
+                        help="Bearer token for the WS bridge (must match "
+                             "the bridge's --auth-token / BRIDGE_AUTH_TOKEN). "
+                             "Defaults to env var BRIDGE_AUTH_TOKEN.")
+    parser.add_argument(
+        "--no-tailscale", "--direct", action="store_true",
+        help="Operator explicit opt-out of the Tailscale layer. With "
+             "this flag set, --auth-token (and $BRIDGE_AUTH_TOKEN) are "
+             "silently ignored -- the dashboard connects to --host with "
+             "no bearer header. Use this when the Pi is on a directly-"
+             "trusted LAN (the home AP, a known wired connection).")
     args = parser.parse_args()
+
+    if args.no_tailscale and args.auth_token:
+        # Silent: --no-tailscale wins, as agreed in the design call.
+        print("[dashboard] --no-tailscale set; ignoring --auth-token",
+              file=sys.stderr)
+        args.auth_token = ""
 
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
@@ -858,6 +1090,7 @@ def main():
         tof_up_max=args.tof_up_max,
         tof_down_min=args.tof_down_min,
         tof_down_max=args.tof_down_max,
+        auth_token=args.auth_token,
     )
     win.show()
     sys.exit(app.exec_())

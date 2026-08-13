@@ -141,8 +141,11 @@ void readSensors() {
 
 // ===================== Hand-rolled JSON (no ArduinoJson) =====================
 void emitStatusLine() {
-  unsigned int speed = motor_drive.getSpeed();
-  L298N::Direction d = motor_drive.getDirection();
+  // L298NX2 has no aggregate getter; both motors are commanded to the
+  // same value in setDriveMotors(), so reading motor A is the source
+  // of truth for the status line.
+  unsigned int speed = motor_drive.getSpeedA();
+  L298N::Direction d = motor_drive.getDirectionA();
   const char* dir_s = (d == L298N::FORWARD) ? "FORWARD" :
                       (d == L298N::BACKWARD) ? "BACKWARD" : "STOP";
 
@@ -218,7 +221,7 @@ void loop() {
   }
 
   // 3. LED flash when drive is active (preserved)
-  if (motor_drive.getSpeed() > 0) {
+  if (motor_drive.getSpeedA() > 0) {
     if (millis() - led_flash_timer >= 150) {
       led_state = !led_state;
       digitalWrite(ledPin, led_state ? HIGH : LOW);
@@ -359,16 +362,16 @@ void setBarPosition(String pose){
     servo_hub.writeMicroseconds(chServoBarDownR, angleToPulse2(90));
   }
   else if (pose == "up_detach") {
-    servo_hub.writeMicroseconds(chServoBarUpL, angleToPulse2(90 - angle_change));
-    servo_hub.writeMicroseconds(chServoBarUpR, angleToPulse2(180 - (90 - angle_change)));
-    servo_hub.writeMicroseconds(chServoBarDownL, angleToPulse2(90 + angle_change));
-    servo_hub.writeMicroseconds(chServoBarDownR, angleToPulse2(180 - (90 + angle_change)));
-  }
-  else if (pose == "down_detach") {
     servo_hub.writeMicroseconds(chServoBarUpL, angleToPulse2(90 + angle_change));
     servo_hub.writeMicroseconds(chServoBarUpR, angleToPulse2(180 - (90 + angle_change)));
     servo_hub.writeMicroseconds(chServoBarDownL, angleToPulse2(90 - angle_change));
     servo_hub.writeMicroseconds(chServoBarDownR, angleToPulse2(180 - (90 - angle_change)));
+  }
+  else if (pose == "down_detach") {
+    servo_hub.writeMicroseconds(chServoBarUpL, angleToPulse2(90 - angle_change));
+    servo_hub.writeMicroseconds(chServoBarUpR, angleToPulse2(180 - (90 - angle_change)));
+    servo_hub.writeMicroseconds(chServoBarDownL, angleToPulse2(90 + angle_change));
+    servo_hub.writeMicroseconds(chServoBarDownR, angleToPulse2(180 - (90 + angle_change)));
   }
   current_bar_pose = pose;
 }

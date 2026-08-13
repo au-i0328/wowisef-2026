@@ -23,7 +23,7 @@ PS4 controller  --USB/BT-->  MacBook  --WiFi-->  Pi Zero 2 W  --USB-->  Arduino 
 |------|---------------|---------|
 | `arduino/arduino_bridge.ino` | Arduino UNO | Motor/servo control + TOF + 200ms status JSON |
 | `pi/pi_serial_bridge.py`     | Pi Zero 2 W | USB-serial <-> WebSocket bus relay |
-| `pi/pi_video_stream.py`      | Pi Zero 2 W | USB webcam -> MJPEG HTTP stream |
+| `pi/pi_video_stream.py`      | Pi Zero 2 W | USB webcam -> MJPEG HTTP stream (accepts `--no-tailscale`) |
 | `pi/pi_ap_setup.sh`          | Pi Zero 2 W | hostapd + dnsmasq access-point setup |
 | `pi/pi_install.sh`           | Pi Zero 2 W | One-shot installer + systemd units |
 | `laptop/gamepad_to_pi.py`    | MacBook | PS4 controller -> WS commands |
@@ -184,6 +184,40 @@ Outgoing message kinds:
 
 4. Optional browser check: open `http://192.168.4.1:8080/stream` to see
    the live video feed.
+
+### Direct / `--no-tailscale` mode (no mesh, no auth)
+
+All four Python programs accept `--no-tailscale` (alias `--direct`).
+It's an explicit opt-out of the Tailscale layer: the bridge skips
+auth, the dashboard + gamepad skip the bearer header. Use it when
+the Pi and Mac are on a directly-trusted LAN (the home AP, a known
+wired connection) and you don't want the Tailscale dependency.
+
+```bash
+# Pi side (direct IP, no mesh)
+sudo python3 pi_serial_bridge.py --no-tailscale
+sudo python3 pi_video_stream.py  --no-tailscale
+
+# Mac side, talking directly to the AP IP
+python3 mac_dashboard.py  --host 192.168.4.1 --no-tailscale
+python3 gamepad_to_pi.py --host 192.168.4.1 --no-tailscale
+```
+
+Conflict policy: if you pass `--no-tailscale` *and* `--auth-token`
+(or `$BRIDGE_AUTH_TOKEN`), `--no-tailscale` silently wins. The token
+is cleared, the bridge logs a one-line warning at startup, and the
+WS bus accepts any client on the network. There is no scenario
+where both can be set at once -- this keeps the trust story in one
+place.
+
+The two shell installer scripts accept the same flag (or the env
+var `NO_TAILSCALE=1`) and dry-run cleanly without sudo:
+
+```bash
+sudo TAILSCALE_AUTHKEY=tskey-auth-... bash pi_tailscale_setup.sh  # install
+sudo bash pi_tailscale_setup.sh --no-tailscale                    # skip
+NO_TAILSCALE=1 bash mac_tailscale_setup.sh                       # skip on Mac
+```
 
 ## Test mode
 
