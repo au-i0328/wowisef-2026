@@ -78,8 +78,31 @@ unsigned long led_flash_timer = 0;
 bool led_state = true;
 
 // --------- Motors ----------
-L298NX2 motor_drive(6, 13, 12, 5, 8, 7);
 unsigned int run_time_to_pose = 1500;
+
+// L298NX2 pin map (must match the constructor above):
+// EN_A=6, IN1_A=13, IN2_A=12, EN_B=5, IN1_B=8, IN2_B=7.
+const uint8_t DRV_EN_A  = 6;
+const uint8_t DRV_IN1_A = 13;
+const uint8_t DRV_IN2_A = 12;
+const uint8_t DRV_EN_B  = 5;
+const uint8_t DRV_IN1_B = 8;
+const uint8_t DRV_IN2_B = 7;
+
+L298NX2 motor_drive(DRV_EN_A, DRV_IN1_A, DRV_IN2_A, DRV_EN_B, DRV_IN1_B, DRV_IN2_B);
+
+pinMode(DRV_EN_A, OUTPUT);
+pinMode(DRV_IN1_A, OUTPUT);
+pinMode(DRV_IN2_A, OUTPUT);
+pinMode(DRV_EN_B, OUTPUT);
+pinMode(DRV_IN1_B, OUTPUT);
+pinMode(DRV_IN2_B, OUTPUT);
+digitalWrite(DRV_EN_A, LOW);
+digitalWrite(DRV_IN1_A, LOW);
+digitalWrite(DRV_IN2_A, LOW);
+digitalWrite(DRV_EN_B, LOW);
+digitalWrite(DRV_IN1_B, LOW);
+digitalWrite(DRV_IN2_B, LOW);
 
 Adafruit_PWMServoDriver servo_hub = Adafruit_PWMServoDriver(0x40);
 
@@ -183,6 +206,7 @@ void setup() {
   digitalWrite(ledPin, HIGH);
 
   motor_drive.stop();
+  applyActiveBrake();  // XY160D active-brake convention.
 
   Wire.begin();
   servo_hub.begin();
@@ -282,6 +306,7 @@ void parseAndExecuteWarning(String payload) {
   }
   // Stop the drive motors immediately.
   motor_drive.stop();
+  applyActiveBrake();  // XY160D active-brake convention.
   digitalWrite(ledPin, LOW);
   latched = true;
   strncpy(latch_reason, sensor.c_str(), sizeof(latch_reason) - 1);
@@ -301,6 +326,11 @@ void setDriveMotors(int speed, String direction){
 
   motor_drive.setSpeed(speed);
   motor_drive.run(curDirection);
+
+  if (speed == 0) {
+    // XY160D active brake: IN=HIGH/HIGH on both motors.
+    applyActiveBrake();
+  }
 
   if (speed > 0) {
     digitalWrite(ledPin, HIGH);
@@ -333,6 +363,7 @@ void executeCommand(String cmd) {
     // clicks "Run both_attach" to recover, which clears the latch
     // and moves the gripper into the safe pose in one step.
     motor_drive.stop();
+    applyActiveBrake();  // XY160D active-brake convention.
     digitalWrite(ledPin, LOW);
     latched = true;
     strncpy(latch_reason, "estop", sizeof(latch_reason) - 1);
@@ -420,4 +451,14 @@ void both_detach() {
   servo_hub.writeMicroseconds(chServoUpR, angleToPulse(180 - open_position));
   servo_hub.writeMicroseconds(chServoDownL, angleToPulse(open_position));
   servo_hub.writeMicroseconds(chServoDownR, angleToPulse(180 - open_position));
+}
+
+// Active-brake override for the XY160D driver.
+void applyActiveBrake() {
+  digitalWrite(DRV_IN1_A, HIGH);
+  digitalWrite(DRV_IN2_A, HIGH);
+  digitalWrite(DRV_IN1_B, HIGH);
+  digitalWrite(DRV_IN2_B, HIGH);
+  digitalWrite(DRV_EN_A,  HIGH);
+  digitalWrite(DRV_EN_B,  HIGH);
 }
