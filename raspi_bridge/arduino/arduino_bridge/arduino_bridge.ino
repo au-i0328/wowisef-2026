@@ -316,6 +316,15 @@ void parseAndExecuteWarning(String payload) {
 }
 
 void setDriveMotors(int speed, String direction){
+  if (speed == 0) {
+    // XY160D active brake: route through motor_drive.stop() so the library
+    // reports direction=STOP to the dashboard (matches every other brake
+    // path), then override the GPIO levels to IN=HIGH/HIGH + EN=HIGH.
+    motor_drive.stop();
+    applyActiveBrake();
+    return;
+  }
+
   L298N::Direction curDirection;
   if (direction == "FORWARD") {
     curDirection = L298N::FORWARD;
@@ -327,14 +336,7 @@ void setDriveMotors(int speed, String direction){
   motor_drive.setSpeed(speed);
   motor_drive.run(curDirection);
 
-  if (speed == 0) {
-    // XY160D active brake: IN=HIGH/HIGH on both motors.
-    applyActiveBrake();
-  }
-
-  if (speed > 0) {
-    digitalWrite(ledPin, HIGH);
-  }
+  digitalWrite(ledPin, HIGH);
 }
 
 void executeCommand(String cmd) {
