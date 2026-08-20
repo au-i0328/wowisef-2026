@@ -91,29 +91,16 @@ const uint8_t DRV_IN2_B = 7;
 
 L298NX2 motor_drive(DRV_EN_A, DRV_IN1_A, DRV_IN2_A, DRV_EN_B, DRV_IN1_B, DRV_IN2_B);
 
-pinMode(DRV_EN_A, OUTPUT);
-pinMode(DRV_IN1_A, OUTPUT);
-pinMode(DRV_IN2_A, OUTPUT);
-pinMode(DRV_EN_B, OUTPUT);
-pinMode(DRV_IN1_B, OUTPUT);
-pinMode(DRV_IN2_B, OUTPUT);
-digitalWrite(DRV_EN_A, LOW);
-digitalWrite(DRV_IN1_A, LOW);
-digitalWrite(DRV_IN2_A, LOW);
-digitalWrite(DRV_EN_B, LOW);
-digitalWrite(DRV_IN1_B, LOW);
-digitalWrite(DRV_IN2_B, LOW);
-
 Adafruit_PWMServoDriver servo_hub = Adafruit_PWMServoDriver(0x40);
 
-const int chServoUpL = 0;
-const int chServoUpR = 1;
-const int chServoDownL = 2;
-const int chServoDownR = 3;
-const int chServoBarUpL = 4;
-const int chServoBarUpR = 5;
-const int chServoBarDownL = 6;
-const int chServoBarDownR = 7;
+const int chServoUpL = 3;
+const int chServoUpR = 2;
+const int chServoDownL = 12;
+const int chServoDownR = 13;
+const int chServoBarUpL = 0;
+const int chServoBarUpR = 1;
+const int chServoBarDownL = 15;
+const int chServoBarDownR = 14;
 
 const float open_position = 0; //degrees
 const float close_position = 100; //degrees
@@ -204,6 +191,21 @@ void setup() {
 
   pinMode(ledPin, OUTPUT);
   digitalWrite(ledPin, HIGH);
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);
+
+  pinMode(DRV_EN_A, OUTPUT);
+  pinMode(DRV_IN1_A, OUTPUT);
+  pinMode(DRV_IN2_A, OUTPUT);
+  pinMode(DRV_EN_B, OUTPUT);
+  pinMode(DRV_IN1_B, OUTPUT);
+  pinMode(DRV_IN2_B, OUTPUT);
+  digitalWrite(DRV_EN_A, LOW);
+  digitalWrite(DRV_IN1_A, LOW);
+  digitalWrite(DRV_IN2_A, LOW);
+  digitalWrite(DRV_EN_B, LOW);
+  digitalWrite(DRV_IN1_B, LOW);
+  digitalWrite(DRV_IN2_B, LOW);
 
   motor_drive.stop();
   applyActiveBrake();  // XY160D active-brake convention.
@@ -249,10 +251,12 @@ void loop() {
     if (millis() - led_flash_timer >= 150) {
       led_state = !led_state;
       digitalWrite(ledPin, led_state ? HIGH : LOW);
+      digitalWrite(LED_BUILTIN, led_state ? HIGH : LOW);
       led_flash_timer = millis();
     }
   } else {
     digitalWrite(ledPin, LOW);
+    digitalWrite(LED_BUILTIN, LOW);
     led_state = true;
     led_flash_timer = millis();
   }
@@ -461,6 +465,6 @@ void applyActiveBrake() {
   digitalWrite(DRV_IN2_A, HIGH);
   digitalWrite(DRV_IN1_B, HIGH);
   digitalWrite(DRV_IN2_B, HIGH);
-  digitalWrite(DRV_EN_A,  HIGH);
-  digitalWrite(DRV_EN_B,  HIGH);
+  digitalWrite(DRV_EN_A,  LOW);
+  digitalWrite(DRV_EN_B,  LOW);
 }

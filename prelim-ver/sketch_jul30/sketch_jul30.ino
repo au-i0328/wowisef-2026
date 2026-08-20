@@ -89,7 +89,7 @@ void loop() {
   }
 
   // Flash LED when drive motor has power
-  if (motor_drive.getSpeed() > 0) {
+  if (motor_drive.getSpeedA() > 0) {
     if (millis() - led_flash_timer >= 150) {
       led_state = !led_state;
       digitalWrite(ledPin, led_state ? HIGH : LOW);
