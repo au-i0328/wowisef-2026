@@ -24,6 +24,10 @@
 const int TOF_UP_XSHUT = 10;
 const int TOF_DOWN_XSHUT  = 11;
 
+// Set this to false to disable both VL53L0X sensors completely. Disabled
+// sensors remain held in hardware reset and are never read or re-initialised.
+const bool TOF_ENABLED = true;
+
 VL53L0X          tof_up;
 VL53L0X          tof_down;
 
@@ -100,6 +104,14 @@ static uint16_t angleToPulse2(float angle, float minAngle=0, float maxAngle=180,
 
 // ===================== Sensor init =====================
 bool initTOF() {
+  if (!TOF_ENABLED) {
+    pinMode(TOF_UP_XSHUT, OUTPUT);
+    pinMode(TOF_DOWN_XSHUT, OUTPUT);
+    digitalWrite(TOF_UP_XSHUT, LOW);
+    digitalWrite(TOF_DOWN_XSHUT, LOW);
+    return false;
+  }
+
   pinMode(TOF_UP_XSHUT, OUTPUT);
   pinMode(TOF_DOWN_XSHUT,  OUTPUT);
   digitalWrite(TOF_DOWN_XSHUT,  LOW);
@@ -120,6 +132,11 @@ bool initTOF() {
 }
 
 void readSensors() {
+  if (!TOF_ENABLED) {
+    tof_up_mm = 0;
+    tof_down_mm = 0;
+    return;
+  }
   tof_up_mm = tof_up.readRangeContinuousMillimeters();
   tof_down_mm  = tof_down.readRangeContinuousMillimeters();
 }
@@ -151,7 +168,9 @@ void emitStatusLine() {
     Serial.print(F("\""));
   }
   Serial.print(F(",\"tof\":{"
-                 "\"up\":"));
+                 "\"enabled\":"));
+  Serial.print(TOF_ENABLED ? "true" : "false");
+  Serial.print(F(",\"up\":"));
   Serial.print(tof_up_mm);
   Serial.print(F(",\"down\":"));
   Serial.print(tof_down_mm);
@@ -255,6 +274,11 @@ void parseAndExecuteWarning(String payload) {
   String sensor = payload.substring(5);
   sensor.trim();
   if (sensor != "up" && sensor != "down") {
+    return;
+  }
+  if (!TOF_ENABLED) {
+    Serial.print(F("WARN:ignored tof disabled:"));
+    Serial.println(sensor);
     return;
   }
   motor_drive.stop();

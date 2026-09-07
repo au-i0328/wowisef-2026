@@ -59,12 +59,19 @@ TOF_UP_MAX_MM   = 400
 TOF_DOWN_MIN_MM = 30
 TOF_DOWN_MAX_MM = 400
 
+# Sentinel that the Arduino publishes for "sensor down / no fresh sample"
+# (mirrors the VL53L0X internal timeout value, which is well above any
+# sane threshold -- default range tops out at 400 mm). When this value
+# arrives the dashboard treats the corresponding sensor as OFFLINE.
+TOF_OFFLINE = 0xFFFF
+
 
 # ---------------------------- Telemetry state ----------------------------
 @dataclass
 class Telemetry:
     tof_up: int = 0
     tof_down: int = 0
+    tof_enabled: bool = True
     drive_speed: int = 0
     direction: str = "FORWARD"
     bar_pose: str = "parallel"
@@ -72,6 +79,11 @@ class Telemetry:
     received_at: float = 0.0
     latched: bool = False
     latch_reason: str = ""
+    altitude_mode: str = "manual"
+    true_height_mm: float = 0.0
+    target_altitude_mm: float = 0.0
+    pitch_deg: float = 0.0
+    roll_deg: float = 0.0
 
 
 # ---------------------------- Async WS client (subscribe-only) ----------------------------
@@ -444,6 +456,8 @@ class SessionLogger:
                 "host_t_ms",
                 "tof_up_mm", "tof_down_mm",
                 "speed", "direction", "bar_pose", "last_ack", "latched",
+                "altitude_mode", "true_height_mm", "target_altitude_mm",
+                "pitch_deg", "roll_deg",
             ])
         self._lock = Lock()
 
@@ -455,6 +469,8 @@ class SessionLogger:
                     t.tof_up, t.tof_down,
                     t.drive_speed, t.direction, t.bar_pose, t.last_ack,
                     int(t.latched),
+                    t.altitude_mode, t.true_height_mm, t.target_altitude_mm,
+                    t.pitch_deg, t.roll_deg,
                 ])
             with open(self.jsonl_path, "a") as f:
                 f.write(json.dumps({
@@ -466,6 +482,13 @@ class SessionLogger:
                         "bar_pose": t.bar_pose,
                         "last_ack": t.last_ack,
                         "latched": t.latched,
+                    },
+                    "altitude": {
+                        "mode": t.altitude_mode,
+                        "true_height_mm": t.true_height_mm,
+                        "target_altitude_mm": t.target_altitude_mm,
+                        "pitch_deg": t.pitch_deg,
+                        "roll_deg": t.roll_deg,
                     },
                 }) + "\n")
 
@@ -612,6 +635,24 @@ class Dashboard(QtWidgets.QMainWindow):
         tof_layout.addRow("", self.lbl_tof_down_limits)
         right_layout.addWidget(tof_box)
 
+        # Altitude (new)
+        alt_box = QtWidgets.QGroupBox("Altitude Control")
+        alt_layout = QtWidgets.QFormLayout(alt_box)
+        self.lbl_altitude_mode = QtWidgets.QLabel("manual")
+        self.lbl_true_height = QtWidgets.QLabel("0.0")
+        self.lbl_target_altitude = QtWidgets.QLabel("0.0")
+        self.lbl_pitch = QtWidgets.QLabel("0.00")
+        self.lbl_roll = QtWidgets.QLabel("0.00")
+        for lbl in (self.lbl_altitude_mode, self.lbl_true_height, 
+                    self.lbl_target_altitude, self.lbl_pitch, self.lbl_roll):
+            lbl.setStyleSheet("font-family:Menlo,monospace;font-size:13px")
+        alt_layout.addRow("Mode", self.lbl_altitude_mode)
+        alt_layout.addRow("Height (mm)", self.lbl_true_height)
+        alt_layout.addRow("Target (mm)", self.lbl_target_altitude)
+        alt_layout.addRow("Pitch (°)", self.lbl_pitch)
+        alt_layout.addRow("Roll (°)", self.lbl_roll)
+        right_layout.addWidget(alt_box)
+
         # Recovery prompt: shown only while at least one sensor is in
         # violation. One-click path back to a safe state via both_attach.
         self.warn_prompt = QtWidgets.QFrame(right)
@@ -728,7 +769,15 @@ class Dashboard(QtWidgets.QMainWindow):
         )
 
     def _set_warning(self, sensor: str, state: str, value: int):
-        """sensor: 'up' or 'down'; state: 'ok' / 'low' / 'high'."""
+        """sensor: 'up' or 'down'; state: 'ok' / 'low' / 'high' / 'offline'.
+
+        'offline' is reported when the Arduino publishes the TOF_OFFLINE
+        sentinel (the sensor itself or its retry couldn't be brought up).
+        We log it like a warning but do NOT echo WARN:<sensor> to the
+        bridge: the Arduino already knows its own sensor is down and is
+        power-cycling it on its watchdog schedule -- sending another
+        latch would pile on top of an already-stuck robot.
+        """
         prev = self._warning_state.get(sensor, "ok")
         if state == prev:
             return
@@ -739,11 +788,16 @@ class Dashboard(QtWidgets.QMainWindow):
         if state == "ok":
             self._add_log(f"TOF {sensor} OK ({value} mm)")
             self.logger.log_event(f"tof_{sensor}_ok={value}")
+        elif state == "offline":
+            self._add_log(f"TOF {sensor} OFFLINE (sensor not responding)")
+            self.logger.log_event(f"tof_{sensor}_offline=65535")
+            # No WARN echo -- the Arduino's own watchdog is already
+            # trying to recover the sensor every TOF_RETRY_AFTER_MS.
         else:
             self._add_log(
                 f"TOF {sensor} {state.upper()} ({value} mm) "
                 f"outside [{self.tof_up_min if sensor == 'up' else self.tof_down_min}, "
-                f"{self.tof_up_max if sensor == 'up' else self.tof_down_max}] mm"
+                f"{self.tof_up_max if sensor == 'up' else self.tof_up_max}] mm"
             )
             self.logger.log_event(f"tof_{sensor}_{state}={value}")
             # Tell the Arduino to latch. The Pi bridge forwards this as a
@@ -766,7 +820,11 @@ class Dashboard(QtWidgets.QMainWindow):
         if reason == "estop":
             text = "EMERGENCY STOP"
         else:
-            parts = [f"TOF {s.upper()} {states[s].upper()}" for s in violators]
+            def label_for(s: str) -> str:
+                if states[s] == "offline":
+                    return f"TOF {s.upper()} OFFLINE"
+                return f"TOF {s.upper()} {states[s].upper()}"
+            parts = [label_for(s) for s in violators]
             text = "  •  ".join(parts)
         self.warning_label.setText("  ⚠  " + text + "  ⚠  ")
         self.warning_banner.setVisible(True)
@@ -776,23 +834,30 @@ class Dashboard(QtWidgets.QMainWindow):
 
     def _refresh_warn_prompt(self):
         states = self._warning_state
+        # Offline sensors aren't "out of range" -- they aren't reporting
+        # anything. Group them separately so the operator knows whether
+        # they're looking at a wiring problem or a geometric violation.
         violators = [s for s in ("up", "down") if states[s] != "ok"]
+        offline   = [s for s in violators if states[s] == "offline"]
+        out_range = [s for s in violators if states[s] != "offline"]
         self.warn_prompt.setVisible(bool(violators))
         if not violators:
             return
-        sensor_list = ", ".join(s.upper() for s in violators)
         # If the Arduino told us why it's latched, surface that reason so
         # the operator knows whether it's a TOF violation or an estop.
         reason = (self.telem.latch_reason
                   if hasattr(self, "telem") else "")
-        if reason in ("up", "down"):
-            head = f"⚠  TOF {reason.upper()} out of range — Arduino has stopped.\n"
-        elif reason == "estop":
+        if reason == "estop":
             head = "⚠  EMERGENCY STOP — Arduino has stopped.\n"
-        elif violators:
-            head = f"⚠  TOF {sensor_list} out of range — Arduino has stopped.\n"
+        elif reason in ("up", "down"):
+            head = f"⚠  TOF {reason.upper()} out of range — Arduino has stopped.\n"
+        elif offline and not out_range:
+            sensors = ", ".join(s.upper() for s in offline)
+            head = (f"⚠  TOF {sensors} sensor offline — Arduino has "
+                    f"stopped waiting on fresh readings.\n")
         else:
-            head = "⚠  Arduino has stopped.\n"
+            sensors = ", ".join(s.upper() for s in violators)
+            head = f"⚠  TOF {sensors} out of range — Arduino has stopped.\n"
         self.warn_prompt_label.setText(
             head + "Run both_attach to recover."
         )
@@ -802,10 +867,13 @@ class Dashboard(QtWidgets.QMainWindow):
         # which (a) executes the bar-pose command on the Arduino, and (b)
         # is the first non-NONE command the latched Arduino will see, so
         # it also clears the latch.
+        
+        # SET RECOVERY TIMER FIRST to prevent race condition
         self._recovery_quiet_until = time.monotonic() + 1.5  # cover delay_to_pose
-        # Releasing the test-warning latch: real telemetry takes over
-        # threshold checks again on the next frame.
+        
+        # THEN clear test flag (prevents threshold check firing mid-recovery)
         self._test_warn_active = False
+        
         self._send_manual("both_attach")
         self._add_log("Recovery: requested both_attach; latch should clear "
                       "on the next Arduino status frame.")
@@ -871,6 +939,7 @@ class Dashboard(QtWidgets.QMainWindow):
         with self.telem_lock:
             self.telem.tof_up   = tof.get("up", 0)
             self.telem.tof_down = tof.get("down", 0)
+            self.telem.tof_enabled = bool(tof.get("enabled", True))
             self.telem.drive_speed = int(msg.get("speed", 0))
             self.telem.direction   = str(msg.get("dir", "FORWARD"))
             self.telem.bar_pose    = str(msg.get("pose", "parallel"))
@@ -878,6 +947,11 @@ class Dashboard(QtWidgets.QMainWindow):
             self.telem.received_at = time.time()
             self.telem.latched     = bool(msg.get("latched", False))
             self.telem.latch_reason = str(msg.get("latch_reason", "")) if self.telem.latched else ""
+            self.telem.altitude_mode = str(msg.get("mode", "manual"))
+            self.telem.true_height_mm = float(msg.get("true_height", 0.0))
+            self.telem.target_altitude_mm = float(msg.get("target_alt", 0.0))
+            self.telem.pitch_deg = float(msg.get("pitch", 0.0))
+            self.telem.roll_deg = float(msg.get("roll", 0.0))
         self.logger.log_telemetry(self.telem)
         if not self.telem.latched:
             # When the Arduino confirms the latch has cleared (e.g. after
@@ -906,6 +980,14 @@ class Dashboard(QtWidgets.QMainWindow):
         self._check_tof_thresholds(self.telem.tof_up, self.telem.tof_down)
 
     def _check_tof_thresholds(self, up_mm: int, down_mm: int):
+        # When the operator has disabled TOF in the Arduino sketch, the
+        # 0xFFFF values are placeholders rather than sensor failures.
+        if not self.telem.tof_enabled:
+            for sensor in ("up", "down"):
+                if self._warning_state.get(sensor, "ok") != "ok":
+                    self._set_warning(sensor, "ok", TOF_OFFLINE)
+            return
+
         # While a test warning is in flight, freeze the dashboard's
         # warning state. The operator has explicitly asked the dashboard
         # to show the warning; we shouldn't undo that just because real
@@ -917,25 +999,30 @@ class Dashboard(QtWidgets.QMainWindow):
         # values; we'd otherwise flicker the banner through ok/low/ok/low.
         if time.monotonic() < self._recovery_quiet_until:
             return
-        # Mark sensors as "have we ever seen a non-zero reading?" Once true
-        # we trust that 0 is a real low reading rather than the Arduino's
-        # "not yet sampled" placeholder.
-        if up_mm > 0:
-            self._tof_seen["up"] = True
-        if down_mm > 0:
-            self._tof_seen["down"] = True
 
-        def state_for(sensor: str, value: int, lo: int, hi: int) -> str:
+        def state_for(sensor: str, value: int) -> str:
+            # Offline sentinel takes priority over everything else -- it
+            # means the Arduino can't read the sensor at all, not that
+            # the reading is out of range.
+            if value == TOF_OFFLINE:
+                return "offline"
+            # Mark sensors as "have we ever seen a non-zero reading?"
+            # Once true we trust that 0 is a real low reading rather
+            # than the Arduino's "not yet sampled" placeholder.
+            if value > 0:
+                self._tof_seen[sensor] = True
             if value == 0 and not self._tof_seen[sensor]:
-                return "ok"  # No data yet — suppress the bootstrap flash.
+                return "ok"  # No data yet -- suppress the bootstrap flash.
+            lo = self.tof_up_min if sensor == "up" else self.tof_down_min
+            hi = self.tof_up_max if sensor == "up" else self.tof_down_max
             if value < lo:
                 return "low"
             if value > hi:
                 return "high"
             return "ok"
 
-        self._set_warning("up",   state_for("up",   up_mm,   self.tof_up_min,   self.tof_up_max),   up_mm)
-        self._set_warning("down", state_for("down", down_mm, self.tof_down_min, self.tof_down_max), down_mm)
+        self._set_warning("up",   state_for("up",   up_mm),   up_mm)
+        self._set_warning("down", state_for("down", down_mm), down_mm)
 
     def _on_ack(self, cmd: str):
         with self.telem_lock:
@@ -1014,13 +1101,17 @@ class Dashboard(QtWidgets.QMainWindow):
         red = "color:#c33;font-weight:bold"
         up_state = self._warning_state.get("up", "ok")
         down_state = self._warning_state.get("down", "ok")
-        self.lbl_tof_up.setText(str(t.tof_up))
+        # Render the offline sentinel as the text "OFFLINE" rather than a
+        # naked 65535 -- readable to a human and unambiguous in the log.
+        up_text   = "OFFLINE" if t.tof_up   == TOF_OFFLINE else str(t.tof_up)
+        down_text = "OFFLINE" if t.tof_down == TOF_OFFLINE else str(t.tof_down)
+        self.lbl_tof_up.setText(up_text)
         self.lbl_tof_up.setStyleSheet(
             f"font-family:Menlo,monospace;font-size:13px;{red}"
             if up_state != "ok" else
             "font-family:Menlo,monospace;font-size:13px"
         )
-        self.lbl_tof_down.setText(str(t.tof_down))
+        self.lbl_tof_down.setText(down_text)
         self.lbl_tof_down.setStyleSheet(
             f"font-family:Menlo,monospace;font-size:13px;{red}"
             if down_state != "ok" else
@@ -1040,6 +1131,19 @@ class Dashboard(QtWidgets.QMainWindow):
             if t.latched else
             "font-family:Menlo,monospace;font-size:13px;color:#3c3"
         )
+        
+        # Altitude control fields
+        self.lbl_altitude_mode.setText(t.altitude_mode)
+        mode_color = "#3c3" if t.altitude_mode in ("hold", "run_to") else ""
+        self.lbl_altitude_mode.setStyleSheet(
+            f"font-family:Menlo,monospace;font-size:13px;color:{mode_color};font-weight:bold"
+            if mode_color else
+            "font-family:Menlo,monospace;font-size:13px"
+        )
+        self.lbl_true_height.setText(f"{t.true_height_mm:.1f}")
+        self.lbl_target_altitude.setText(f"{t.target_altitude_mm:.1f}")
+        self.lbl_pitch.setText(f"{t.pitch_deg:.2f}")
+        self.lbl_roll.setText(f"{t.roll_deg:.2f}")
 
     def closeEvent(self, ev):
         try:

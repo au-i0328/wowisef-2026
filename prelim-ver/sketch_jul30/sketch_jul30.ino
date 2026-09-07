@@ -14,14 +14,14 @@ unsigned int run_time_to_pose = 1500; //to be tuned
 
 Adafruit_PWMServoDriver servo_hub = Adafruit_PWMServoDriver(0x40);
 
-const int chServoUpL = 0;
-const int chServoUpR = 1;
-const int chServoDownL = 2;
-const int chServoDownR = 3;
-const int chServoBarUpL = 4;
-const int chServoBarUpR = 5;
-const int chServoBarDownL = 6;
-const int chServoBarDownR = 7;
+const int chServoUpL = 3;
+const int chServoUpR = 2;
+const int chServoDownL = 12;
+const int chServoDownR = 13;
+const int chServoBarUpL = 0;
+const int chServoBarUpR = 1;
+const int chServoBarDownL = 7;
+const int chServoBarDownR = 14;
 
 const float open_position = 0; //ref to left servo absolute position
 const float close_position = 100;

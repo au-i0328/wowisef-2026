@@ -214,11 +214,12 @@ class SerialBus:
                     speed = msg.get("speed", 0)
                     direction = msg.get("dir", "FORWARD")
                     command = msg.get("cmd", "NONE")
+                    altitude_mode = msg.get("altitude_mode", "manual")
                     if command in ("up_attach", "up_detach",
                                    "down_attach", "down_detach",
                                    "both_attach", "both_detach",
                                    "estop", "NONE"):
-                        return f"{int(speed)},{direction},{command}\n"
+                        return f"{int(speed)},{direction},{command},{altitude_mode}\n"
                     if command.startswith("WARN:") and command[5:] in ("up", "down"):
                         return command + "\n"
         except json.JSONDecodeError:
@@ -232,12 +233,14 @@ class SerialBus:
         "down_attach", "down_detach",
         "both_attach", "both_detach",
         "estop",
+        "set_alt", "hold_alt", "zero_alt", "manual",
     })
 
     @staticmethod
     def _looks_like_csv(text: str) -> bool:
         parts = text.split(",")
-        if len(parts) != 3:
+        # Support both 3-field (old) and 4-field (new with altitude) formats
+        if len(parts) not in (3, 4):
             return False
         try:
             int(parts[0])
@@ -295,6 +298,12 @@ class SerialBus:
             elif line.startswith("ACK:"):
                 cmd = line[4:].strip()
                 await self._broadcast({"kind": "ack", "cmd": cmd})
+            elif line.startswith("WARNED:"):
+                sensor = line[7:].strip()
+                await self._broadcast({"kind": "warned", "sensor": sensor})
+            elif line.startswith("INIT:"):
+                rest = line[5:].strip()
+                await self._broadcast({"kind": "init", "message": rest})
             else:
                 log.debug("Non-framed line: %r", line[:80])
 

@@ -30,7 +30,7 @@ import websockets
 # ---------------------------- Configuration (preserved) ----------------------------
 BAUD_RATE_NOT_USED = 115200  # Documentation only; no longer a serial link.
 SEND_RATE = 30               # 30 Hz
-HOLD_FRAMES = 3               # ~100ms pulse
+HOLD_FRAMES = 1               # ~100ms pulse
 
 # ---------------------------- Helpers (from gamepad_to_arduino.py) ----------------------------
 def normalize_stick(val):
@@ -218,6 +218,17 @@ async def main_async(args):
                     drive_speed = 204
                     drive_direction = "BACKWARD"
 
+                # --- Altitude control mode (separate field) ---
+                # Right trigger (R2) > 10 -> hold_alt mode
+                # D-pad left -> zero_alt (pulse once)
+                # Otherwise -> manual mode
+                altitude_mode = "manual"
+                if channels[5] > 10:  # R2 trigger
+                    altitude_mode = "hold_alt"
+                elif just_pressed(13):  # D-pad left
+                    altitude_mode = "zero_alt"
+
+                # --- Button commands (independent) ---
                 if just_pressed(6):
                     active_command, hold_counter = "down_detach", HOLD_FRAMES
                 elif just_pressed(7):
@@ -244,9 +255,10 @@ async def main_async(args):
                 t = time.time()
                 drive_speed = int((t * 0.5 % 1.0) * 255)
                 command_out = "NONE"
+                altitude_mode = "manual"
                 drive_direction = "FORWARD" if int(t) % 2 == 0 else "BACKWARD"
 
-            csv_payload = f"{drive_speed},{drive_direction},{command_out}\n"
+            csv_payload = f"{drive_speed},{drive_direction},{command_out},{altitude_mode}\n"
             if args.pretty:
                 csv_payload = json.dumps({
                     "kind": "command",
